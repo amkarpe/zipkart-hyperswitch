@@ -11,7 +11,7 @@ CREATE TABLE webhook_failures (
     id           BIGSERIAL PRIMARY KEY,
     received_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     event_id     TEXT,
-    stage        TEXT NOT NULL,       -- parse | store | process (bad signatures are never stored)
+    stage        TEXT NOT NULL,       -- signature (capped per hour) | parse | store | process
     status_code  INT NOT NULL,        -- what we answered
     error        TEXT NOT NULL,
     headers      TEXT,                -- signature value redacted

@@ -13,12 +13,14 @@ Rules:
   3. treat the payload as a hint: ignore its status, GET the payment/refund from
      Hyperswitch and apply that forward-only (same path as the return page and sweep);
   4. never answer 500. Every outcome is a deliberate status:
-       401 bad signature                 (Hyperswitch will retry; fix the secret)
+       401 bad signature                 (recorded, capped, with a diagnosis; Hyperswitch retries)
        400 signed but unparseable         (recorded in webhook_failures; retrying won't help)
        200 processed / duplicate / not ours / unsupported type
        503 couldn't finish right now      (DB or Hyperswitch hiccup; Hyperswitch retries,
                                            the sweep is the backstop)
 """
+import base64
+import gzip
 import hashlib
 import hmac
 import json
@@ -36,6 +38,10 @@ from app.db import pool
 log = logging.getLogger("zipkart.webhooks")
 router = APIRouter()
 SIGNATURE_HEADER = "x-webhook-signature-512"
+# Signature failures are recorded too (they'd otherwise leave no trace), but capped and
+# truncated so unauthenticated traffic can't fill the database.
+MAX_SIGNATURE_FAILURES_PER_HOUR = 50
+MAX_STORED_BODY = 64 * 1024
 OBJECT_ID_FIELD = {"payment_details": "payment_id", "refund_details": "refund_id"}
 
 
@@ -82,6 +88,30 @@ def parse_event(body: bytes) -> dict:
     return {"event_id": event_id, "event_type": event_type, "kind": kind, "object_id": object_id}
 
 
+def diagnose_signature(body: bytes, received: str | None) -> str:
+    """Why a signature didn't verify, without revealing the secret or the expected value."""
+    if not received:
+        return "no X-Webhook-Signature-512 header"
+    r = received.strip()
+    secret = settings.hyperswitch_webhook_secret.encode()
+    facts = [f"received len={len(r)}", f"hex={all(c in '0123456789abcdefABCDEF' for c in r)}"]
+    variants = {"sha512-hex": hmac.new(secret, body, hashlib.sha512).hexdigest(),
+                "sha256-hex": hmac.new(secret, body, hashlib.sha256).hexdigest(),
+                "sha512-base64": base64.b64encode(hmac.new(secret, body, hashlib.sha512).digest()).decode()}
+    if body[:2] == b"\x1f\x8b":
+        facts.append("body is gzip")
+        try:
+            variants["sha512-hex over gunzipped body"] = hmac.new(secret, gzip.decompress(body), hashlib.sha512).hexdigest()
+        except OSError:
+            facts.append("gunzip failed")
+    stripped = body.strip()
+    if stripped != body:
+        variants["sha512-hex over stripped body"] = hmac.new(secret, stripped, hashlib.sha512).hexdigest()
+    matched = [name for name, v in variants.items() if hmac.compare_digest(v.lower().encode(), r.lower().encode("utf-8", "replace"))]
+    facts.append(f"matches: {', '.join(matched) if matched else 'none of ' + ', '.join(variants)}")
+    return "; ".join(facts)
+
+
 def _text(body: bytes) -> str:
     # Postgres TEXT can't hold NUL bytes; everything else is kept verbatim.
     return body.decode("utf-8", "replace").replace("\x00", "\\u0000")
@@ -105,12 +135,32 @@ async def _record_failure(request: Request, body: bytes, stage: str, status: int
         log.exception("could not record webhook failure")
 
 
+async def _record_signature_failure(request: Request, body: bytes, diagnosis: str) -> None:
+    try:
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT count(*) AS n FROM webhook_failures WHERE stage = 'signature' "
+                "AND received_at > now() - interval '1 hour'")
+            if (await cur.fetchone())["n"] >= MAX_SIGNATURE_FAILURES_PER_HOUR:
+                return
+            await conn.execute(
+                """INSERT INTO webhook_failures (stage, status_code, error, headers, raw_body)
+                   VALUES ('signature', 401, %s, %s, %s)""",
+                (f"bad signature ({len(body)} bytes): {diagnosis}", _headers_for_log(request),
+                 _text(body[:MAX_STORED_BODY])),
+            )
+    except Exception:   # noqa: BLE001
+        log.exception("could not record signature failure")
+
+
 @router.post("/webhooks/hyperswitch")
 async def hyperswitch_webhook(request: Request):
     body = await request.body()   # raw bytes, before any parsing
-    if not signature_valid(body, request.headers.get(SIGNATURE_HEADER)):
-        # Not stored: unauthenticated input must not be able to write to our database.
-        log.warning("webhook rejected: bad or missing signature (%d bytes)", len(body))
+    received = request.headers.get(SIGNATURE_HEADER)
+    if not signature_valid(body, received):
+        diagnosis = diagnose_signature(body, received)
+        log.warning("webhook rejected: bad or missing signature (%d bytes): %s", len(body), diagnosis)
+        await _record_signature_failure(request, body, diagnosis)
         return JSONResponse({"error": "invalid signature"}, status_code=401)
 
     try:

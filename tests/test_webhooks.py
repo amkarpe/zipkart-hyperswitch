@@ -16,7 +16,9 @@ from pathlib import Path
 
 import pytest
 
-from app.webhooks import Malformed, parse_event, sign, signature_valid
+import gzip
+
+from app.webhooks import Malformed, diagnose_signature, parse_event, sign, signature_valid
 
 FIXTURE = Path(__file__).parent / "fixtures" / "hyperswitch_payment_event.json"
 REAL = FIXTURE.read_bytes()
@@ -40,6 +42,17 @@ def test_bad_signatures_are_rejected_not_crashed():
     assert not signature_valid(REAL, "ab" * 64)
     assert not signature_valid(REAL, "é" * 10)                       # used to raise TypeError -> 500
     assert not signature_valid(REAL.replace(b"payment_authorized", b"payment_failed"), sign(REAL))
+
+
+def test_signature_diagnosis_explains_mismatches_without_the_secret():
+    assert diagnose_signature(REAL, None) == "no X-Webhook-Signature-512 header"
+    d = diagnose_signature(REAL, "ab" * 64)
+    assert "received len=128" in d and "hex=True" in d and "matches: none of" in d
+    # Body compressed in transit, signature computed over the uncompressed JSON:
+    zipped = gzip.compress(REAL)
+    assert "body is gzip" in diagnose_signature(zipped, sign(REAL))
+    assert "matches: sha512-hex over gunzipped body" in diagnose_signature(zipped, sign(REAL))
+    assert sign(REAL) not in diagnose_signature(REAL, "00")   # never echoes the expected value
 
 
 # ── Parsing the real format ─────────────────────────────────────────────────
@@ -108,7 +121,8 @@ def event_ids():
     from app.config import settings
     with psycopg.connect(settings.database_url, prepare_threshold=None) as conn:
         conn.execute("DELETE FROM webhook_events WHERE event_id = ANY(%s)", (ids,))
-        conn.execute("DELETE FROM webhook_failures WHERE event_id = ANY(%s) OR raw_body LIKE '%%evt_test_%%'", (ids,))
+        conn.execute("DELETE FROM webhook_failures WHERE event_id = ANY(%s) OR raw_body LIKE '%%evt_test_%%' "
+                     "OR (stage = 'signature' AND raw_body LIKE '%%evt_fixture_payment_authorized%%')", (ids,))
 
 
 def post(client, body: bytes, signature: str | None = "valid"):
@@ -155,6 +169,16 @@ def test_signed_but_malformed_is_400_and_recorded(client, event_ids):
     assert sign(body) not in row[2]          # signature value is redacted in the stored headers
 
 
-def test_unsigned_is_401(client):
+def test_unsigned_is_401_and_recorded_with_diagnosis(client, event_ids):
     assert post(client, REAL, signature=None).status_code == 401
     assert post(client, REAL, signature="00" * 64).status_code == 401
+
+    import psycopg
+
+    from app.config import settings
+    with psycopg.connect(settings.database_url, prepare_threshold=None) as conn:
+        errors = [r[0] for r in conn.execute(
+            "SELECT error FROM webhook_failures WHERE stage = 'signature' AND raw_body LIKE %s "
+            "AND received_at > now() - interval '1 minute' ORDER BY id", ("%evt_fixture_payment_authorized%",))]
+    assert any("no X-Webhook-Signature-512 header" in e for e in errors)
+    assert any("received len=128" in e and "matches: none of" in e for e in errors)
