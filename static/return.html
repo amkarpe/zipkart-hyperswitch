@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ZipKart Order Status</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header><span class="logo">ZipKart</span><span class="tag">Groceries delivered today</span></header>
+  <main class="narrow">
+    <div class="panel">
+      <div class="status-hero">
+        <div class="icon" id="s-icon">⏳</div>
+        <h1 id="s-title">Checking your payment…</h1>
+        <p class="muted" id="s-body"></p>
+        <div id="s-action"></div>
+      </div>
+    </div>
+    <div class="panel hidden" id="summary">
+      <h2>Order <code id="s-order"></code></h2>
+      <div id="s-lines"></div>
+      <div class="row total"><span>Estimated total</span><span id="s-total"></span></div>
+      <div class="row"><span class="muted">Temporary hold</span><span class="muted" id="s-hold"></span></div>
+    </div>
+  </main>
+  <script src="/static/return.js"></script>
+</body>
+</html>

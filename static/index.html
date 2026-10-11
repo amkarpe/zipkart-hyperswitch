@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ZipKart Checkout</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header><span class="logo">ZipKart</span><span class="tag">Groceries delivered today</span></header>
+  <main>
+    <div class="layout">
+      <section id="catalog"></section>
+
+      <aside>
+        <div class="panel" id="cart-panel">
+          <h2>Your cart</h2>
+          <div id="cart-lines" class="muted">Add something tasty.</div>
+          <div id="totals" class="hidden">
+            <div class="row"><span>Items (estimate)</span><span id="t-subtotal"></span></div>
+            <div class="row"><span>Tax</span><span id="t-tax"></span></div>
+            <div class="row"><span>Delivery</span><span id="t-delivery"></span></div>
+            <div class="row total"><span>Estimated total</span><span id="t-total"></span></div>
+            <p class="muted" id="t-weighed-note"></p>
+          </div>
+        </div>
+
+        <div class="panel" id="details-panel">
+          <h2>Delivery details</h2>
+          <form id="details-form" autocomplete="on">
+            <label for="f-name">Full name</label><input id="f-name" name="name" required value="Jordan Rivera">
+            <div class="two">
+              <div><label for="f-email">Email</label><input id="f-email" name="email" type="email" required value="jordan.rivera@example.com"></div>
+              <div><label for="f-phone">Phone (10 digits)</label><input id="f-phone" name="phone" required pattern="\d{10}" value="5125550142"></div>
+            </div>
+            <label for="f-line1">Street address</label><input id="f-line1" name="line1" required value="1100 Congress Ave">
+            <label for="f-line2">Apt / unit (optional)</label><input id="f-line2" name="line2" value="">
+            <div class="three">
+              <div><label for="f-city">City</label><input id="f-city" name="city" required value="Austin"></div>
+              <div><label for="f-state">State</label><input id="f-state" name="state" required pattern="[A-Z]{2}" maxlength="2" value="TX"></div>
+              <div><label for="f-zip">ZIP</label><input id="f-zip" name="zip" required pattern="\d{5}" value="78701"></div>
+            </div>
+            <div id="details-error" class="error hidden"></div>
+            <button type="submit" class="primary" id="continue-btn" style="margin-top:14px" disabled>Continue to payment</button>
+          </form>
+        </div>
+
+        <div class="panel hidden" id="payment-panel">
+          <h2>Payment</h2>
+          <div class="hold" id="hold-message"></div>
+          <div id="unified-checkout"></div>
+          <div id="payment-error" class="error hidden"></div>
+          <button class="primary" id="pay-btn" disabled>Place order</button>
+          <p class="muted" style="margin-top:10px">Order <code id="order-id"></code></p>
+        </div>
+      </aside>
+    </div>
+  </main>
+  <script src="/static/checkout.js"></script>
+</body>
+</html>
