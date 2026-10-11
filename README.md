@@ -52,6 +52,13 @@ cp .env.example .env        # then fill it in (see below)
 
 Open http://localhost:8000 (shop) and http://localhost:8000/store (store console).
 
+Tests (the HTTP ones need `DATABASE_URL`; they clean up after themselves and make no Hyperswitch calls):
+
+```bash
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q
+```
+
 ### Configuration (`.env`)
 
 | Variable | What it is |
@@ -163,8 +170,8 @@ loads, and Hyperswitch retries webhooks that arrive while the app is asleep.
   would need the card saved and the authorization taken close to the delivery window.
 - **Webhooks in production** need the public URL configured in Hyperswitch (local testing used
   correctly and incorrectly signed sample requests).
-- **No automated test suite yet.** Each feature was tested with scripts against the sandbox and in
-  the browser during development.
+- **Automated tests cover the webhook handler only** (`tests/`, using a real-format Hyperswitch
+  event). Everything else was tested with scripts against the sandbox and in the browser.
 
 ## Project layout
 
