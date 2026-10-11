@@ -11,7 +11,7 @@ services:
     # scripts/migrate.py is idempotent and safe if two instances start together.
     startCommand: python -m scripts.migrate && uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips="*"
     healthCheckPath: /health
-    autoDeploy: false
+    autoDeploy: true    # push to main deploys
     envVars:
       - key: PYTHON_VERSION
         value: "3.10.14"
