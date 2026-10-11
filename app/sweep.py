@@ -5,7 +5,9 @@ loads (Render's free tier sleeps, so the timer alone isn't enough). Each part on
 ever (1) GETs from Hyperswitch and applies that forward-only, or (2) finishes an
 action whose intent is already committed. Nothing is retried blindly.
 
-  a. sync payments stuck in non-final states for longer than RECONCILE_AFTER_MINUTES
+  a. sync payments stuck in non-final states for longer than RECONCILE_AFTER_MINUTES,
+     including checkouts that look unpaid to us (the customer may have paid and
+     closed the tab before the return page, with the webhook lost)
   b. finish orders stuck in 'cancelling'
   c. void inactive payment attempts that still hold funds
   d. retry awaiting_settlement refunds for captures made before the last cut-off
@@ -34,6 +36,8 @@ log = logging.getLogger("zipkart.sweep")
 LEASE = timedelta(minutes=3)
 SETTLEMENT_MARGIN = timedelta(minutes=30)   # batch settles shortly after the cut-off
 BATCH = 50
+ABANDONED_BATCH = 20                        # unpaid checkouts fetched per run
+SESSION_GRACE = timedelta(minutes=5)        # after expiry, one more look and we stop
 _OWNER = f"{socket.gethostname()}:{os.getpid()}"
 
 
@@ -80,11 +84,25 @@ async def _sync_stale_payments() -> list[dict]:
         (settings.reconcile_after_minutes, BATCH),
     )
 
+    # An unpaid checkout is "requires_payment_method" in OUR database until we sync it,
+    # even if the customer already paid inside the SDK. Look at those too, but only while
+    # the session could still have been paid (until expiry + grace), capped per run, and
+    # least-recently-checked first so every abandoned checkout gets its turn.
+    rows += await _rows(
+        """SELECT p.payment_id FROM payments p JOIN orders o ON o.id = p.order_id
+           WHERE p.is_active AND o.status = 'pending_payment'
+             AND p.status IN ('requires_payment_method', 'requires_confirmation')
+             AND p.created_at < now() - make_interval(mins => %s)
+             AND (p.last_synced_at IS NULL OR p.expires_at IS NULL OR p.last_synced_at < p.expires_at + %s)
+           ORDER BY COALESCE(p.last_synced_at, p.created_at) LIMIT %s""",
+        (settings.reconcile_after_minutes, SESSION_GRACE, ABANDONED_BATCH),
+    )
+
     async def sync(row):
         before = (await _rows("SELECT status FROM payments WHERE payment_id = %s", (row["payment_id"],)))[0]["status"]
         after = await payments._record(row["payment_id"], await hs.retrieve_payment(row["payment_id"]))
         return f"{before} -> {after}" if after != before else None   # report only changes
-    return await _each("sync", rows, sync)
+    return await _each("sync", list({r["payment_id"]: r for r in rows}.values()), sync)
 
 
 # b ──────────────────────────────────────────────────────────────────────────

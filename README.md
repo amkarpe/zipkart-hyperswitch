@@ -61,7 +61,7 @@ Open http://localhost:8000 (shop) and http://localhost:8000/store (store console
 | `HYPERSWITCH_PROFILE_ID` | Business profile with Authorize.net enabled. |
 | `HYPERSWITCH_WEBHOOK_SECRET` | The profile's *payment response hash key* (signs webhooks). |
 | `DATABASE_URL` | Neon **pooled** connection string (host contains `-pooler`). |
-| `APP_BASE_URL` | Where the app is reachable; used for the payment `return_url`. |
+| `APP_BASE_URL` | Where the app is reachable; used for the payment `return_url`. **On Render it must match the service URL exactly** (e.g. `https://zipkart-eiwx.onrender.com`, not a guessed `https://zipkart.onrender.com`). A wrong value sends customers who just paid to someone else's site, with their `client_secret` in the URL. The app logs a warning at startup if it's not https in production or differs from Render's `RENDER_EXTERNAL_URL`. |
 | `STORE_CONSOLE_PASSWORD` | **The store console password.** Shoppers log in with it at `/store`. Changing it logs every session out. |
 | `WEIGHT_BUFFER_PERCENT` | Extra hold on weighed items (default 15). |
 | `SUBSTITUTION_TIMEOUT_SECONDS` | How long a customer has to answer a substitution (default 60). |
@@ -122,8 +122,13 @@ velocity filter.
 - **Health check:** `/health` (runs a real query against the database)
 
 After the first deploy:
-1. Set `APP_BASE_URL` to the Render URL and redeploy.
+1. Copy the service URL from the Render dashboard **exactly** (Render may add a suffix such as
+   `-eiwx`), set `APP_BASE_URL` to it and redeploy. Check the startup log for an `APP_BASE_URL`
+   warning.
 2. In the Hyperswitch dashboard, set the profile's webhook URL to `https://<app>/webhooks/hyperswitch`.
+3. Make a test payment and confirm the webhook deliveries show HTTP 200 in the Hyperswitch dashboard.
+   Deliveries that can't be processed are recorded in the `webhook_failures` table (stage, error,
+   headers with the signature redacted, raw body).
 
 **Cold starts:** Render's free tier sleeps after ~15 minutes idle; the first request after that
 takes up to a minute. Neon also scales to zero, but wakes in well under a second. While the app

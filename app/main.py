@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import re
 from contextlib import asynccontextmanager
 from decimal import Decimal
@@ -28,6 +29,7 @@ from app.webhooks import router as webhook_router
 from app.views import quote_breakdown
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("zipkart")
 
 _SECRET_PARAM = re.compile(r"((?:payment_intent_)?client_secret=)[^&\s\"]*")
 
@@ -50,7 +52,20 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 
 @asynccontextmanager
+def _check_base_url() -> None:
+    """APP_BASE_URL becomes the payment return_url: if it's wrong, customers who just paid
+    are redirected to someone else's site, carrying their client_secret in the URL."""
+    base = settings.app_base_url
+    if settings.app_env == "production" and not base.startswith("https://"):
+        log.warning("APP_BASE_URL=%r is not https in production; payment redirects would be insecure", base)
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")   # set by Render automatically
+    if render_url and render_url != base:
+        log.warning("APP_BASE_URL=%r does not match this service's Render URL %r; customers would be "
+                    "redirected to the wrong site after paying", base, render_url)
+
+
 async def lifespan(_app: FastAPI):
+    _check_base_url()
     await open_pool()
     sweeper = asyncio.create_task(sweep.sweep_forever())
     yield
