@@ -182,3 +182,40 @@ def test_unsigned_is_401_and_recorded_with_diagnosis(client, event_ids):
             "AND received_at > now() - interval '1 minute' ORDER BY id", ("%evt_fixture_payment_authorized%",))]
     assert any("no X-Webhook-Signature-512 header" in e for e in errors)
     assert any("received len=128" in e and "matches: none of" in e for e in errors)
+
+
+# ── A real delivery captured from Hyperswitch (webhook.site, 2026-10-11) ─────
+# refund_failed from Authorize.net, error 54 (capture not settled yet). Byte-for-byte
+# as sent; the signature is the one Hyperswitch actually sent with it.
+REFUND_54 = (Path(__file__).parent / "fixtures" / "hyperswitch_refund_failed_54.json").read_bytes()
+REFUND_54_SIGNATURE = ("d3c112df7387e3ee92762d6b6146219e33111f2bc2850a49e27eb6626ac908d3"
+                       "abcf1ee444bfb91e1510a82eb310f33d567f756bfa64d78f38e80f81c4b0c22e")
+REAL_HEADERS = {"accept-encoding": "gzip", "accept": "*/*", "user-agent": "Hyperswitch-Backend-Server",
+                "via": "HyperSwitch", "content-type": "application/json"}
+
+
+def test_real_hyperswitch_signature_verifies():
+    # Requires HYPERSWITCH_WEBHOOK_SECRET to be the profile's payment response hash key.
+    assert len(REFUND_54) == 996
+    assert signature_valid(REFUND_54, REFUND_54_SIGNATURE)
+
+
+def test_parses_real_refund_failed_54():
+    assert parse_event(REFUND_54) == {"event_id": "evt_01a12d22c2287d72a9a3927486d1e264",
+                                      "event_type": "refund_failed", "kind": "refund_details",
+                                      "object_id": "rf_ZKQ2GA3EEHYJ_48_damaged_r12_a8"}
+    obj = json.loads(REFUND_54)["content"]["object"]
+    assert obj["error_code"] == "54" and obj["unified_code"] == "UE_4000" and obj["connector"] == "authorizedotnet"
+
+
+def test_real_delivery_with_real_headers_through_handler(client, monkeypatch):
+    from app import hyperswitch as hs
+
+    async def fake_retrieve_refund(refund_id):
+        return json.loads(REFUND_54)["content"]["object"]
+    monkeypatch.setattr(hs, "retrieve_refund", fake_retrieve_refund)
+    r = client.post("/webhooks/hyperswitch", content=REFUND_54,
+                    headers={**REAL_HEADERS, "x-webhook-signature-512": REFUND_54_SIGNATURE})
+    # Already delivered to production during the replay, so this is the dedupe path.
+    status = r.json()["status"]
+    assert r.status_code == 200 and (status == "duplicate" or status.startswith("synced refund"))
