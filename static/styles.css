@@ -79,3 +79,37 @@ form input { width: 100%; font: inherit; padding: 8px; border: 1px solid var(--b
 .status-hero h1 { font-size: 22px; margin: 8px 0; }
 .narrow { max-width: 560px; margin: 0 auto; }
 code { font-size: 13px; }
+
+/* ── Phase 2 ── */
+fieldset.pref { border: 1px solid var(--border); border-radius: 8px; margin: 12px 0 0; padding: 8px 10px 10px; }
+fieldset.pref legend { font-size: 12px; color: var(--muted); padding: 0 4px; }
+label.radio { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; color: var(--text); margin: 6px 0 0; cursor: pointer; }
+label.radio input { width: auto; margin-top: 3px; }
+.breakdown { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin: 0 0 12px; font-size: 14px; }
+.breakdown p { margin: 6px 0 0; }
+.prompt { border: 2px solid var(--brand); border-radius: var(--radius); padding: 14px; margin: 0 0 16px; background: var(--surface); }
+.prompt .actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.prompt .actions button { flex: 1; min-width: 140px; }
+.countdown { font-variant-numeric: tabular-nums; color: var(--warn-ink); background: var(--warn-soft); border-radius: 999px; padding: 1px 8px; font-size: 12px; }
+.pill { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--brand-soft); color: var(--text); white-space: nowrap; }
+.pill.warn { background: var(--warn-soft); color: var(--warn-ink); }
+.pill.bad { background: var(--danger-soft); color: var(--danger); }
+.change { padding: 6px 0; border-top: 1px dashed var(--border); }
+.change:first-child { border-top: 0; }
+.strike { text-decoration: line-through; color: var(--muted); }
+button.secondary { width: 100%; padding: 10px 14px; }
+button.danger { color: var(--danger); border-color: var(--danger); }
+table.lines { width: 100%; border-collapse: collapse; font-size: 14px; }
+table.lines td, table.lines th { padding: 8px 6px; border-top: 1px solid var(--border); text-align: left; vertical-align: top; }
+table.lines th { font-size: 12px; color: var(--muted); font-weight: 600; border-top: 0; }
+.inline { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.inline input, .inline select { width: auto; font: inherit; padding: 5px 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); }
+.inline input[type=number] { width: 80px; }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 12px; }
+.kpi { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+.kpi .v { font-weight: 700; font-size: 17px; font-variant-numeric: tabular-nums; }
+.kpi .l { font-size: 12px; color: var(--muted); }
+form.report select, form.report input[type=text], form.report input[type=number] { width: 100%; font: inherit; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); }
+form.report label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 2px; }
+form.report .actions button { flex: 1; }
+button.primary.blocked:disabled { opacity: 1; background: var(--warn-soft); border-color: var(--warn-ink); color: var(--warn-ink); cursor: not-allowed; }

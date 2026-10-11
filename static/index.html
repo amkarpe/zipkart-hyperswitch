@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ZipKart Checkout</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v=8">
 </head>
 <body>
   <header><span class="logo">ZipKart</span><span class="tag">Groceries delivered today</span></header>
@@ -40,6 +40,13 @@
               <div><label for="f-state">State</label><input id="f-state" name="state" required pattern="[A-Z]{2}" maxlength="2" value="TX"></div>
               <div><label for="f-zip">ZIP</label><input id="f-zip" name="zip" required pattern="\d{5}" value="78701"></div>
             </div>
+            <fieldset class="pref">
+              <legend>If an item is out of stock</legend>
+              <label class="radio"><input type="radio" name="substitution_preference" value="best_match" checked>
+                <span><strong>Best match</strong>: we'll suggest a similar item; you can accept or decline</span></label>
+              <label class="radio"><input type="radio" name="substitution_preference" value="remove">
+                <span><strong>Remove it</strong>: we'll take it off your order</span></label>
+            </fieldset>
             <div id="details-error" class="error hidden"></div>
             <button type="submit" class="primary" id="continue-btn" style="margin-top:14px" disabled>Continue to payment</button>
           </form>
@@ -48,6 +55,7 @@
         <div class="panel hidden" id="payment-panel">
           <h2>Payment</h2>
           <div class="hold" id="hold-message"></div>
+          <div id="hold-breakdown"></div>
           <div id="unified-checkout"></div>
           <div id="payment-error" class="error hidden"></div>
           <button class="primary" id="pay-btn" disabled>Place order</button>
@@ -56,6 +64,7 @@
       </aside>
     </div>
   </main>
-  <script src="/static/checkout.js"></script>
+  <script src="/static/common.js?v=8"></script>
+  <script src="/static/checkout.js?v=8"></script>
 </body>
 </html>

@@ -20,6 +20,8 @@ from app import hyperswitch as hs
 from app.config import settings
 from app.db import pool
 from app.pricing import Quote, price_cart
+from app.views import hold_breakdown
+from app.views import order_view as _order_view
 
 log = logging.getLogger("zipkart.payments")
 
@@ -35,6 +37,7 @@ _PROGRESS = [
     "requires_confirmation",
     "requires_customer_action",
     "processing",
+    "requires_merchant_action",   # processor holding it for review (Authorize.net fraud filters)
     "requires_capture",
     "partially_captured_and_capturable",
 ]
@@ -80,10 +83,24 @@ def _parse_ts(value: str | None) -> datetime | None:
 class CheckoutError(Exception):
     """Something the customer can act on (bad cart, declined, try again)."""
 
-    def __init__(self, message: str, http_status: int = 400):
+    def __init__(self, message: str, http_status: int = 400, order_id: str | None = None):
         super().__init__(message)
         self.message = message
         self.http_status = http_status
+        # Set once the order is committed, so the browser resumes it instead of re-submitting.
+        self.order_id = order_id
+
+
+async def _fetch_payment(payment_id: str) -> dict:
+    """GET a payment, turning both failure kinds into something the customer can act on."""
+    try:
+        return await hs.retrieve_payment(payment_id)
+    except hs.HyperswitchUnavailable as exc:
+        log.warning("retrieve %s outcome unknown: %s", payment_id, exc)
+        raise CheckoutError("Payment service is slow to respond. Please try again.", 503)
+    except hs.HyperswitchError as exc:
+        log.error("retrieve %s failed: %s %s", payment_id, exc.code, exc.message)
+        raise CheckoutError("We couldn't load your payment. Please try again.", 502)
 
 
 # ── Catalog ────────────────────────────────────────────────────────────────
@@ -222,6 +239,17 @@ async def _apply_snapshot(conn, payment_id: str, snap: dict) -> str:
     )
     updated = await cur.fetchone()
     if updated is None:
+        if row["status"] in _FINAL and row["status"] != "create_failed" and new_status in _FINAL:
+            # One final state replaced by another, e.g. "cancelled" after "partially_captured".
+            # Verified in sandbox: Hyperswitch allows /cancel after a partial capture on
+            # Authorize.net, which voids the whole capture. Never guess: flag the order.
+            log.error("payment %s: Hyperswitch reports %s after %s", payment_id, new_status, row["status"])
+            await conn.execute(
+                """UPDATE orders SET status = 'needs_review', review_reason = %s, updated_at = now()
+                   WHERE id = (SELECT order_id FROM payments WHERE payment_id = %s) AND status <> 'needs_review'""",
+                (f"Hyperswitch reports {new_status} after {row['status']} for {payment_id}", payment_id),
+            )
+            return row["status"]
         # Stale or out-of-order view (e.g. "processing" after we saw "requires_capture"): ignore.
         log.info("payment %s: ignored backward transition %s -> %s", payment_id, row["status"], new_status)
         return row["status"]
@@ -231,7 +259,8 @@ async def _apply_snapshot(conn, payment_id: str, snap: dict) -> str:
 async def _advance_order(conn, payment_id: str) -> None:
     """Move the order forward based on its ACTIVE payment. Inside the caller's transaction."""
     cur = await conn.execute(
-        """SELECT p.status, p.is_active, p.amount_capturable_cents, o.id AS order_id, o.hold_amount_cents
+        """SELECT p.status, p.is_active, p.amount_capturable_cents, p.amount_received_cents,
+                  o.id AS order_id, o.status AS order_status, o.hold_amount_cents, o.final_amount_cents
            FROM payments p JOIN orders o ON o.id = p.order_id
            WHERE p.payment_id = %s""",
         (payment_id,),
@@ -245,14 +274,37 @@ async def _advance_order(conn, payment_id: str) -> None:
         return
 
     if row["status"] in ("failed", "cancelled"):
+        # We asked for it: finish the cancel.
+        await conn.execute(
+            "UPDATE orders SET status = 'cancelled', cancelled_at = now(), updated_at = now() "
+            "WHERE id = %s AND status = 'cancelling'",
+            (row["order_id"],),
+        )
         # Normal before authorization (customer retries). After the order moved on
         # (authorized/picking/...) it means money state we didn't drive: flag, don't guess.
-        # The cancel flow (later step) moves the order to 'cancelling' first, so it's excluded.
         await conn.execute(
             "UPDATE orders SET status = 'needs_review', review_reason = %s, updated_at = now() "
-            "WHERE id = %s AND status IN ('authorized', 'picking', 'finalizing')",
+            "WHERE id = %s AND status IN ('authorized', 'picking', 'finalizing', 'capturing')",
             (f"Active payment {payment_id} became {row['status']} after authorization", row["order_id"]),
         )
+        return
+
+    if row["status"] in ("partially_captured", "succeeded"):
+        # Both mean captured (verified: capturing exactly net_amount gives "succeeded").
+        received = row["amount_received_cents"]
+        if row["order_status"] == "capturing" and received == row["final_amount_cents"]:
+            await conn.execute(
+                "UPDATE orders SET status = 'captured', captured_amount_cents = %s, captured_at = now(), "
+                "updated_at = now() WHERE id = %s AND status = 'capturing'",
+                (received, row["order_id"]),
+            )
+        elif row["order_status"] not in ("captured", "delivered", "needs_review"):
+            await conn.execute(
+                "UPDATE orders SET status = 'needs_review', captured_amount_cents = %s, review_reason = %s, "
+                "updated_at = now() WHERE id = %s AND status NOT IN ('captured', 'delivered', 'needs_review')",
+                (received, f"Captured {received} while order was {row['order_status']} "
+                           f"(expected {row['final_amount_cents']})", row["order_id"]),
+            )
         return
 
     if row["status"] == "requires_capture":
@@ -299,7 +351,7 @@ async def _start_payment(order_id: str, payment_id: str, attempt_no: int) -> Non
         snap = await hs.create_payment(payload)
     except hs.HyperswitchError as exc:
         if exc.code == "HE_01":  # already created by an earlier (timed-out) call
-            snap = await hs.retrieve_payment(payment_id)
+            snap = await _fetch_payment(payment_id)
         else:
             async with pool.connection() as conn:
                 await conn.execute(
@@ -322,7 +374,7 @@ async def _start_payment(order_id: str, payment_id: str, attempt_no: int) -> Non
     await _record(payment_id, snap)
 
 
-async def create_order(cart: list[dict], customer: dict) -> dict:
+async def create_order(cart: list[dict], customer: dict, substitution_preference: str) -> dict:
     quote = await quote_cart(cart)
     order_id = new_order_id()
     payment_id = payment_id_for(order_id, 1)
@@ -332,12 +384,14 @@ async def create_order(cart: list[dict], customer: dict) -> dict:
         await conn.execute(
             """INSERT INTO orders (id, currency, customer_name, customer_email, customer_phone,
                    ship_line1, ship_line2, ship_city, ship_state, ship_zip,
-                   subtotal_cents, tax_cents, delivery_fee_cents, estimated_total_cents, hold_amount_cents)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                   subtotal_cents, tax_cents, delivery_fee_cents, estimated_total_cents, hold_amount_cents,
+                   substitution_preference, weight_buffer_percent)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (order_id, settings.currency, customer["name"], customer["email"], customer["phone"],
              customer["line1"], customer.get("line2") or None, customer["city"], customer["state"],
              customer["zip"], quote.subtotal_cents, quote.tax_cents, quote.delivery_fee_cents,
-             quote.estimated_total_cents, quote.hold_amount_cents),
+             quote.estimated_total_cents, quote.hold_amount_cents,
+             substitution_preference, settings.weight_buffer_percent),
         )
         for line in quote.lines:
             await conn.execute(
@@ -353,8 +407,14 @@ async def create_order(cart: list[dict], customer: dict) -> dict:
         )
 
     # Network call with no transaction open, then Tx 2 inside _start_payment.
-    await _start_payment(order_id, payment_id, 1)
-    return await payment_session(order_id)
+    # From here on the order exists: any error must carry its id, or a retry from
+    # the browser would create a second order.
+    try:
+        await _start_payment(order_id, payment_id, 1)
+        return await payment_session(order_id)
+    except CheckoutError as exc:
+        exc.order_id = order_id
+        raise
 
 
 # ── Sync (return page, later: webhooks and sweep) ──────────────────────────
@@ -390,7 +450,7 @@ async def payment_session(order_id: str) -> dict:
     # attempt). Worst case is racing another tab through cancel -> replace -> create.
     for _ in range(6):
         async with pool.connection() as conn:
-            order, _items = await _load_order(conn, order_id)
+            order, items = await _load_order(conn, order_id)
             payment = await _active_payment(conn, order_id)
 
         if order["status"] != "pending_payment":
@@ -400,13 +460,10 @@ async def payment_session(order_id: str) -> dict:
             await _start_payment(order_id, payment["payment_id"], payment["attempt_no"])
             continue
 
-        if payment is not None:
-            try:
-                snap = await hs.retrieve_payment(payment["payment_id"])
-                status = await _record(payment["payment_id"], snap)
-            except hs.HyperswitchUnavailable:
-                raise CheckoutError("Payment service is slow to respond. Please try again.", 503)
-            if status in ("requires_customer_action", "processing", "requires_capture"):
+        # create_failed never reached Hyperswitch (a GET would be HE_02): replace it directly.
+        if payment is not None and payment["status"] != "create_failed":
+            status = await _record(payment["payment_id"], await _fetch_payment(payment["payment_id"]))
+            if status in ("requires_customer_action", "processing", "requires_merchant_action", "requires_capture"):
                 # Customer already submitted a card; send them to the status page.
                 return {"order_id": order_id, "order_status": "pending_payment", "payment_status": status}
             if status == "requires_payment_method":
@@ -422,6 +479,7 @@ async def payment_session(order_id: str) -> dict:
                         "return_url": return_url_for(order_id),
                         "hold_amount_cents": order["hold_amount_cents"],
                         "estimated_total_cents": order["estimated_total_cents"],
+                        "hold_breakdown": hold_breakdown(order, items),
                         "expires_at": payment["expires_at"].isoformat(),
                     }
                 # Expired or nearly so: close it at Hyperswitch first, so a tab still
@@ -433,7 +491,7 @@ async def payment_session(order_id: str) -> dict:
                     continue  # e.g. IR_16: state moved (customer confirmed?) - re-read before replacing
                 except hs.HyperswitchUnavailable:
                     raise CheckoutError("Payment service is slow to respond. Please try again.", 503)
-                await _record(payment["payment_id"], await hs.retrieve_payment(payment["payment_id"]))
+                await _record(payment["payment_id"], await _fetch_payment(payment["payment_id"]))
             elif status not in ("failed", "cancelled", "create_failed"):
                 # Captured/partially captured etc. on a pending order: not ours to "fix" by re-charging.
                 return {"order_id": order_id, "order_status": order["status"], "payment_status": status}
@@ -477,35 +535,7 @@ async def _replace_payment_tx(order_id: str, old: dict | None) -> None:
 
 # ── Read model for the browser (never includes secrets) ────────────────────
 async def order_view(order_id: str) -> dict:
-    async with pool.connection() as conn:
-        order, items = await _load_order(conn, order_id)
-        payment = await _active_payment(conn, order_id)
-    return {
-        "order_id": order["id"],
-        "status": order["status"],
-        "currency": order["currency"],
-        "subtotal_cents": order["subtotal_cents"],
-        "tax_cents": order["tax_cents"],
-        "delivery_fee_cents": order["delivery_fee_cents"],
-        "estimated_total_cents": order["estimated_total_cents"],
-        "hold_amount_cents": order["hold_amount_cents"],
-        "customer_name": order["customer_name"],
-        "items": [
-            {
-                "sku": i["sku"],
-                "name": i["name"],
-                "pricing_type": i["pricing_type"],
-                "quantity": i["quantity"],
-                "estimated_weight_lb": str(i["estimated_weight_lb"]) if i["estimated_weight_lb"] is not None else None,
-                "estimated_line_cents": i["estimated_line_cents"],
-                "status": i["status"],
-            }
-            for i in items
-        ],
-        "payment": None if payment is None else {
-            "attempt_no": payment["attempt_no"],
-            "status": payment["status"],
-            "unified_code": payment["unified_code"],
-            "message": payment["unified_message"],
-        },
-    }
+    view = await _order_view(order_id)
+    if view is None:
+        raise CheckoutError("Order not found.", 404)
+    return view

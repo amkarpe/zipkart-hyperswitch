@@ -61,8 +61,22 @@ async def retrieve_payment(payment_id: str) -> dict:
     return await _request("GET", f"/payments/{payment_id}")
 
 
+async def capture_payment(payment_id: str, amount_to_capture: int) -> dict:
+    # Verified in sandbox: amount_to_capture is the exact total charged and is checked
+    # against net_amount (amount + shipping_cost + order_tax_amount), not `amount`.
+    return await _request("POST", f"/payments/{payment_id}/capture", {"amount_to_capture": amount_to_capture})
+
+
 async def cancel_payment(payment_id: str, reason: str) -> dict:
     return await _request("POST", f"/payments/{payment_id}/cancel", {"cancellation_reason": reason})
+
+
+async def create_refund(payload: dict) -> dict:
+    return await _request("POST", "/refunds", payload)
+
+
+async def retrieve_refund(refund_id: str) -> dict:
+    return await _request("GET", f"/refunds/{refund_id}")
 
 
 async def close() -> None:

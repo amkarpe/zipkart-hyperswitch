@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ZipKart Order</title>
+  <link rel="stylesheet" href="/static/styles.css?v=8">
+</head>
+<body>
+  <header><span class="logo">ZipKart</span><span class="tag">Groceries delivered today</span></header>
+  <main class="narrow">
+    <div id="prompts"></div>
+    <div class="panel">
+      <div class="status-hero">
+        <div class="icon" id="s-icon">⏳</div>
+        <h1 id="s-title">Loading your order…</h1>
+        <p class="muted" id="s-body"></p>
+        <div id="s-action"></div>
+      </div>
+    </div>
+    <div class="panel hidden" id="receipt-panel">
+      <h2>Receipt</h2>
+      <div id="receipt"></div>
+    </div>
+    <div class="panel hidden" id="remedy-panel">
+      <h2>Problems with your order</h2>
+      <div id="remedy-list"></div>
+      <div id="report"></div>
+    </div>
+    <div class="panel hidden" id="hold-panel">
+      <h2>Your temporary hold</h2>
+      <div id="hold-breakdown"></div>
+    </div>
+    <div class="panel hidden" id="summary">
+      <h2>Order <code id="s-order"></code></h2>
+      <p class="muted" id="s-pref"></p>
+      <div id="s-lines"></div>
+      <div id="s-cancel"></div>
+    </div>
+  </main>
+  <script src="/static/common.js?v=8"></script>
+  <script src="/static/order.js?v=8"></script>
+</body>
+</html>

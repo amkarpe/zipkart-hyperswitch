@@ -15,8 +15,6 @@ const state = {
   returnUrl: null,
 };
 
-const $ = (id) => document.getElementById(id);
-const money = (cents) => (cents / 100).toLocaleString("en-US", { style: "currency", currency: "USD" });
 
 async function api(path, options = {}) {
   const resp = await fetch(path, {
@@ -26,7 +24,9 @@ async function api(path, options = {}) {
   const body = await resp.json().catch(() => ({}));
   if (!resp.ok) {
     const detail = body.error || (Array.isArray(body.detail) ? body.detail.map((d) => d.msg).join("; ") : body.detail);
-    throw new Error(detail || `Request failed (${resp.status})`);
+    const err = new Error(detail || `Request failed (${resp.status})`);
+    err.orderId = body.order_id || null;  // set when the server already committed an order
+    throw err;
   }
   return body;
 }
@@ -166,16 +166,24 @@ $("details-form").addEventListener("submit", async (ev) => {
   $("details-error").classList.add("hidden");
   const f = new FormData(ev.target);
   const customer = Object.fromEntries(f.entries());
+  const substitution_preference = customer.substitution_preference;
+  delete customer.substitution_preference;
   customer.state = customer.state.toUpperCase();
   if (!customer.line2) delete customer.line2;
   try {
     const session = await api("/api/orders", {
       method: "POST",
-      body: JSON.stringify({ items: cartItems(), customer }),
+      body: JSON.stringify({ items: cartItems(), customer, substitution_preference }),
     });
     lockCart(session.order_id);
     await showPayment(session);
   } catch (e) {
+    if (e.orderId) {
+      // The order exists; only the payment step failed. Resume it rather than
+      // letting the form be submitted again (which would create a second order).
+      window.location.replace(`/?order=${encodeURIComponent(e.orderId)}`);
+      return;
+    }
     $("details-error").textContent = e.message;
     $("details-error").classList.remove("hidden");
     btn.disabled = false;
@@ -202,6 +210,7 @@ async function showPayment(session) {
   $("hold-message").innerHTML =
     `We'll place a temporary hold of <strong>${money(session.hold_amount_cents)}</strong>. ` +
     `You'll only be charged for what we deliver.`;
+  renderHoldBreakdown($("hold-breakdown"), session.hold_breakdown);
   $("payment-panel").classList.remove("hidden");
 
   await loadScript(HYPER_SDK_URL);
@@ -271,7 +280,7 @@ async function resume(orderId) {
     await showPayment(await api(`/api/orders/${encodeURIComponent(orderId)}/payment-session`, { method: "POST" }));
   } catch (e) {
     $("payment-panel").classList.remove("hidden");
-    $("payment-error").textContent = e.message;
+    $("payment-error").textContent = `${e.message} Refresh the page to try again; your order is saved.`;
     $("payment-error").classList.remove("hidden");
   }
 }

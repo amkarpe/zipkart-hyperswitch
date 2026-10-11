@@ -1,37 +1,86 @@
+import asyncio
 import logging
+import re
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
+from app import fulfillment
 from app import hyperswitch as hs
 from app import payments
+from app import refunds
+from app import sweep
+from app.config import settings
 from app.db import close_pool, open_pool, pool
+from app.fulfillment import FulfillmentError
 from app.payments import CheckoutError
 from app.pricing import PricingError
+from app.refunds import RefundError
+from app.remedies import RemedyError, create_remedy
+from app.store import router as store_router
+from app.webhooks import router as webhook_router
+from app.views import quote_breakdown
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+_SECRET_PARAM = re.compile(r"((?:payment_intent_)?client_secret=)[^&\s\"]*")
+
+
+class RedactClientSecret(logging.Filter):
+    """Hyperswitch redirects to the return page with ?payment_intent_client_secret=...;
+    uvicorn's access log would otherwise write it to Render's logs in plain text."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(_SECRET_PARAM.sub(r"\1[REDACTED]", a) if isinstance(a, str) else a
+                                for a in record.args)
+        if isinstance(record.msg, str):
+            record.msg = _SECRET_PARAM.sub(r"\1[REDACTED]", record.msg)
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(RedactClientSecret())
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await open_pool()
+    sweeper = asyncio.create_task(sweep.sweep_forever())
     yield
+    sweeper.cancel()
     await hs.close()
     await close_pool()
 
 
 app = FastAPI(title="ZipKart", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.include_router(store_router)
+app.include_router(webhook_router)
 
 
 @app.exception_handler(CheckoutError)
 async def _checkout_error(_req, exc: CheckoutError):
+    body = {"error": exc.message}
+    if exc.order_id:
+        body["order_id"] = exc.order_id
+    return JSONResponse(body, status_code=exc.http_status)
+
+
+@app.exception_handler(FulfillmentError)
+async def _fulfillment_error(_req, exc: FulfillmentError):
+    return JSONResponse({"error": exc.message}, status_code=exc.http_status)
+
+
+@app.exception_handler(RemedyError)
+@app.exception_handler(RefundError)
+async def _remedy_error(_req, exc):
     return JSONResponse({"error": exc.message}, status_code=exc.http_status)
 
 
@@ -69,6 +118,7 @@ class QuoteRequest(BaseModel):
 
 class OrderRequest(QuoteRequest):
     customer: Customer
+    substitution_preference: Literal["best_match", "remove"]
 
 
 def _cart(items: list[CartLine]) -> list[dict]:
@@ -81,11 +131,12 @@ async def index_page():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/orders/{order_id}", include_in_schema=False)
 @app.get("/orders/{order_id}/return", include_in_schema=False)
-async def return_page(order_id: str):
-    # Hyperswitch redirects here after confirm (appending payment_id/status, which we
-    # ignore: the page asks our server, and our server asks Hyperswitch).
-    return FileResponse(STATIC_DIR / "return.html")
+async def order_page(order_id: str):
+    # /return is where Hyperswitch redirects after confirm (appending payment_id/status,
+    # which we ignore: the page asks our server, and our server asks Hyperswitch).
+    return FileResponse(STATIC_DIR / "order.html")
 
 
 # ── API ────────────────────────────────────────────────────────────────────
@@ -125,12 +176,13 @@ async def quote(req: QuoteRequest):
         "delivery_fee_cents": q.delivery_fee_cents,
         "estimated_total_cents": q.estimated_total_cents,
         "hold_amount_cents": q.hold_amount_cents,
+        "hold_breakdown": quote_breakdown(q, settings.weight_buffer_percent),
     }
 
 
 @app.post("/api/orders")
 async def create_order(req: OrderRequest):
-    return await payments.create_order(_cart(req.items), req.customer.model_dump())
+    return await payments.create_order(_cart(req.items), req.customer.model_dump(), req.substitution_preference)
 
 
 @app.post("/api/orders/{order_id}/payment-session")
@@ -145,4 +197,42 @@ async def sync(order_id: str):
 
 @app.get("/api/orders/{order_id}")
 async def get_order(order_id: str):
+    # Unanswered substitutions past their deadline get the order's preference here,
+    # on read: no background job needed, and the answer is the same whoever looks first.
+    await fulfillment.apply_expired_substitutions(order_id)
+    return await payments.order_view(order_id)
+
+
+class Decision(BaseModel):
+    decision: Literal["accept", "decline"]
+
+
+@app.post("/api/orders/{order_id}/substitutions/{sub_id}")
+async def decide_substitution(order_id: str, sub_id: int, body: Decision):
+    await fulfillment.decide_substitution(order_id, sub_id, body.decision == "accept")
+    return await payments.order_view(order_id)
+
+
+class ProblemReport(BaseModel):
+    item_id: int
+    reason: Literal["missing", "damaged", "expired"]
+    resolution: Literal["refund", "replacement"]
+    quantity: int | None = Field(default=None, ge=1, le=24)
+    note: str | None = Field(default=None, max_length=280)
+
+
+@app.post("/api/orders/{order_id}/remedies")
+async def report_problem(order_id: str, body: ProblemReport):
+    # Tx 1 (remedies.insert_remedy): validate limits under the order lock and record it.
+    remedy = await create_remedy(order_id, body.item_id, body.reason, body.resolution, body.quantity,
+                                 (body.note or "").strip() or None)
+    # Tx 2 + Hyperswitch call: open refund attempt 1 and send it.
+    if remedy["resolution"] == "refund":
+        await refunds.start_refund(remedy["id"])
+    return await payments.order_view(order_id)
+
+
+@app.post("/api/orders/{order_id}/cancel")
+async def cancel_order(order_id: str):
+    await fulfillment.cancel_order(order_id, "customer")
     return await payments.order_view(order_id)

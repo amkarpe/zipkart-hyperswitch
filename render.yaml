@@ -1,0 +1,47 @@
+# Render Blueprint for ZipKart (free web service; Postgres lives on Neon).
+# Secrets are declared with sync: false, so Render asks for them in the dashboard
+# and never reads them from this file.
+services:
+  - type: web
+    name: zipkart
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # Migrations run on every start: the free plan has no pre-deploy command, and
+    # scripts/migrate.py is idempotent and safe if two instances start together.
+    startCommand: python -m scripts.migrate && uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips="*"
+    healthCheckPath: /health
+    autoDeploy: false
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.10.14"
+      - key: APP_ENV
+        value: production
+      - key: HYPERSWITCH_BASE_URL
+        value: https://sandbox.hyperswitch.io
+      - key: CURRENCY
+        value: USD
+      - key: WEIGHT_BUFFER_PERCENT
+        value: "15"
+      - key: SUBSTITUTION_TIMEOUT_SECONDS
+        value: "60"
+      - key: RECONCILE_AFTER_MINUTES
+        value: "5"
+      - key: SETTLEMENT_CUTOFF
+        value: "15:00"
+      - key: SETTLEMENT_TIMEZONE
+        value: America/Los_Angeles
+      - key: APP_BASE_URL            # https://<your-service>.onrender.com (set after the first deploy)
+        sync: false
+      - key: DATABASE_URL            # Neon pooled connection string
+        sync: false
+      - key: HYPERSWITCH_API_KEY
+        sync: false
+      - key: HYPERSWITCH_PUBLISHABLE_KEY
+        sync: false
+      - key: HYPERSWITCH_PROFILE_ID
+        sync: false
+      - key: HYPERSWITCH_WEBHOOK_SECRET
+        sync: false
+      - key: STORE_CONSOLE_PASSWORD
+        sync: false

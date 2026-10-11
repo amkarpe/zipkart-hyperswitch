@@ -29,6 +29,9 @@ class Settings:
     weight_buffer_percent: int
     substitution_timeout_seconds: int
     reconcile_after_minutes: int
+    sweep_interval_seconds: int
+    settlement_cutoff: str        # "HH:MM", Authorize.net Transaction Cut-Off Time
+    settlement_timezone: str
 
 
 def load_settings() -> Settings:
@@ -46,6 +49,10 @@ def load_settings() -> Settings:
         weight_buffer_percent=int(os.environ.get("WEIGHT_BUFFER_PERCENT", "15")),
         substitution_timeout_seconds=int(os.environ.get("SUBSTITUTION_TIMEOUT_SECONDS", "60")),
         reconcile_after_minutes=int(os.environ.get("RECONCILE_AFTER_MINUTES", "5")),
+        sweep_interval_seconds=int(os.environ.get("SWEEP_INTERVAL_SECONDS", "180")),
+        # Authorize.net's default cut-off is 3:00 PM Pacific (Account > Settings > Transaction Cut-Off Time).
+        settlement_cutoff=os.environ.get("SETTLEMENT_CUTOFF", "15:00").strip(),
+        settlement_timezone=os.environ.get("SETTLEMENT_TIMEZONE", "America/Los_Angeles").strip(),
     )
 
 

@@ -42,6 +42,31 @@ class Quote:
     hold_tax_cents: int           # sent as `order_tax_amount`
     hold_amount_cents: int        # == Hyperswitch net_amount (amount + shipping_cost + order_tax_amount)
 
+    @property
+    def weight_buffer_cents(self) -> int:
+        # Defined as the difference, so estimate + buffer == hold holds to the cent.
+        return self.hold_amount_cents - self.estimated_total_cents
+
+
+@dataclass(frozen=True)
+class Totals:
+    subtotal_cents: int
+    tax_cents: int
+    delivery_fee_cents: int
+    total_cents: int
+
+
+def totals(lines: list[tuple[int, bool]], delivery_fee_cents: int) -> Totals:
+    """(line_cents, taxable) pairs -> subtotal, tax, delivery, total.
+
+    The single place an order total is computed after checkout: the headroom
+    check, the final capture amount and the receipt all call this, so they
+    can't disagree with each other.
+    """
+    subtotal = sum(cents for cents, _ in lines)
+    tax = tax_for(sum(cents for cents, taxable in lines if taxable))
+    return Totals(subtotal, tax, delivery_fee_cents, subtotal + tax + delivery_fee_cents)
+
 
 def _round_cents(value: Decimal) -> int:
     return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))

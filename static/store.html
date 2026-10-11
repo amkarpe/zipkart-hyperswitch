@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ZipKart Store Console</title>
+  <link rel="stylesheet" href="/static/styles.css?v=8">
+</head>
+<body>
+  <header>
+    <span class="logo">ZipKart</span><span class="tag">Store console</span>
+    <span style="flex:1"></span>
+    <button id="logout-btn" class="hidden">Log out</button>
+  </header>
+  <main>
+    <div id="login" class="panel narrow hidden">
+      <h2>Shopper login</h2>
+      <form id="login-form">
+        <label for="password">Store password</label>
+        <input id="password" type="password" autocomplete="current-password" required>
+        <div id="login-error" class="error hidden"></div>
+        <button class="primary" style="margin-top:12px">Log in</button>
+      </form>
+    </div>
+    <div id="queue" class="hidden"></div>
+    <div id="order" class="hidden"></div>
+  </main>
+  <script src="/static/common.js?v=8"></script>
+  <script src="/static/store.js?v=8"></script>
+</body>
+</html>
