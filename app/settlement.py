@@ -50,6 +50,8 @@ def effective_config() -> dict:
         "settlement_margin_hours": item("SETTLEMENT_MARGIN_HOURS", settings.settlement_margin_hours),
         "refund_max_auto_attempts_per_payment": item("REFUND_MAX_AUTO_ATTEMPTS_PER_PAYMENT",
                                                      settings.refund_max_auto_attempts_per_payment),
+        "refund_same_amount_spacing_seconds": item("REFUND_SAME_AMOUNT_SPACING_SECONDS",
+                                                   settings.refund_same_amount_spacing_seconds),
         "store_timezone": item("STORE_TIMEZONE", settings.store_timezone),
     }
 

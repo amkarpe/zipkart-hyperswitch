@@ -122,12 +122,13 @@ Tests (they clean up after themselves and make no Hyperswitch calls):
 | `HYPERSWITCH_WEBHOOK_SECRET` | The profile's *payment response hash key* (signs webhooks). |
 | `DATABASE_URL` | Neon **pooled** connection string (host contains `-pooler`). |
 | `APP_BASE_URL` | Where the app is reachable; used for the payment `return_url`. **On Render it must match the service URL exactly** (e.g. `https://zipkart-eiwx.onrender.com`, not a guessed `https://zipkart.onrender.com`). A wrong value sends customers who just paid to someone else's site, with their `client_secret` in the URL. The app logs a warning at startup if it's not https in production or differs from Render's `RENDER_EXTERNAL_URL`. |
-| `STORE_CONSOLE_PASSWORD` | **The store console password.** Shoppers log in with it at `/store`. Changing it logs every session out. |
+| `STORE_CONSOLE_PASSWORD` | **The store console password.** Store staff (the shoppers who pick orders) log in with it at `/store`. Changing it logs every session out. |
 | `WEIGHT_BUFFER_PERCENT` | Extra hold on weighed items (default 15). |
 | `SUBSTITUTION_TIMEOUT_SECONDS` | How long a customer has to answer a substitution (default 60). |
 | `RECONCILE_AFTER_MINUTES` | How long a payment can sit in a non-final state before the sweep re-checks it. |
 | `SETTLEMENT_CUTOFF`, `SETTLEMENT_TIMEZONE`, `SETTLEMENT_MARGIN_HOURS` | Your Authorize.net Transaction Cut-Off Time (default 16:00 America/Los_Angeles) and how long after it a batch is safely settled (default 6 h). A refund is first sent at *first cut-off after the capture + margin*. |
 | `REFUND_MAX_AUTO_ATTEMPTS_PER_PAYMENT` | Automatic refund attempts per payment across all its remedies (default 4; Hyperswitch allows 11). |
+| `REFUND_SAME_AMOUNT_SPACING_SECONDS` | Minimum gap between two refunds of the same amount on one payment (default 180), to stay clear of Authorize.net's 2-minute duplicate filter. |
 | `STORE_TIMEZONE` | Times shown in the store console and on customer pages (default America/Chicago). |
 | `INTERNAL_SWEEP_SECRET` | Shared secret for `POST /internal/sweep` (header `X-Sweep-Secret`), so an external scheduler can wake the app and run the sweep. Empty disables the endpoint. |
 | `SWEEP_INTERVAL_SECONDS` | Background reconciliation interval (default 180). |
@@ -159,7 +160,7 @@ Open **two windows side by side**: the customer on the left, the store console o
 7. **Customer: report a problem.** Below the receipt: missing (refund), damaged or expired (refund
    or free replacement), with a quantity for fixed-price items. A refund is never sent before the
    capture settles: it's scheduled for the first cut-off after the capture plus a margin
-   (*"Refund of $X approved. It will be sent after your payment settles, by <date>."*), and the
+   (*"Refund of $X approved. It will be sent after your payment settles, by [date]."*), and the
    sweep sends it when it's due. The store console shows each refund's status, next attempt (store
    time) and attempts used out of 4; anything automation can't finish is marked **needs manual
    refund** with the reason. After refunding it in the Authorize.net dashboard, the shopper
@@ -241,10 +242,11 @@ These were observed in the Hyperswitch and Authorize.net sandboxes, and the code
   why the first refund attempt waits until cut-off + 6 hours.
 - **Authorize.net rejects duplicate transactions** (error 11): the same transaction type, card and
   amount within 2 minutes (its default `duplicateWindow`, always 2 minutes in the Virtual
-  Terminal). Observed when two $1.49 refunds were entered for one order in the dashboard. Two
-  automatic refunds of the same amount on one payment, sent in the same sweep run, could likely hit
-  the same filter; the second would go to *needs manual refund*. This hasn't been observed through
-  Hyperswitch.
+  Terminal). Observed when two $1.49 refunds were entered for one order in the dashboard. **Handled:**
+  the sweep sends at most one refund of a given amount per payment every 3 minutes (the other stays
+  scheduled and goes out on a later run), and an error 11 reschedules the refund about 3 minutes
+  later instead of sending it to *needs manual refund* (it still counts toward the 4-attempt cap).
+  Hyperswitch passes Authorize.net's error code through as the refund's `error_code`.
 
 ## Known limitations
 

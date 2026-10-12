@@ -34,6 +34,7 @@ class Settings:
     settlement_timezone: str
     settlement_margin_hours: float
     refund_max_auto_attempts_per_payment: int
+    refund_same_amount_spacing_seconds: int   # Authorize.net duplicate filter (error 11): 2 min
     store_timezone: str
     internal_sweep_secret: str    # empty = POST /internal/sweep disabled
     sweep_timer_enabled: bool     # background timer + sweep-on-console-load
@@ -73,6 +74,8 @@ def load_settings() -> Settings:
         settlement_margin_hours=float(os.environ.get("SETTLEMENT_MARGIN_HOURS", "6")),
         # Hyperswitch allows 11 refunds per payment (failed ones included); stay well below.
         refund_max_auto_attempts_per_payment=int(os.environ.get("REFUND_MAX_AUTO_ATTEMPTS_PER_PAYMENT", "4")),
+        # Authorize.net rejects the same type + card + amount within 2 minutes (error 11).
+        refund_same_amount_spacing_seconds=int(os.environ.get("REFUND_SAME_AMOUNT_SPACING_SECONDS", "180")),
         store_timezone=os.environ.get("STORE_TIMEZONE", "America/Chicago").strip(),
         internal_sweep_secret=os.environ.get("INTERNAL_SWEEP_SECRET", "").strip(),
         sweep_timer_enabled=_sweep_timer_enabled(),

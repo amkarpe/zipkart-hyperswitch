@@ -49,6 +49,7 @@ def test_margin_is_elapsed_time_in_utc():
 @pytest.mark.parametrize("status, code, expected", [
     ("succeeded", None, "refunded"),
     ("failed", "54", "awaiting_settlement"),
+    ("failed", "11", "awaiting_settlement"),
     ("failed", "IR_12", "needs_manual_refund"),
     ("failed", "E00027", "needs_manual_refund"),
     ("failed", None, "needs_manual_refund"),
@@ -195,8 +196,8 @@ def test_cap_holds_across_two_remedies_on_one_payment(db, fake_hs):
     oid, item = db.order(captured_at=now() - timedelta(days=3))
     a, b = db.remedy(oid, item), db.remedy(oid, item)
     for n in range(cap - 1):   # earlier failed attempts on the same payment (remedy a)
-        db.sql("""INSERT INTO refunds (refund_id, remedy_id, payment_id, attempt_no, amount_cents, status, error_code)
-                  VALUES (%s, %s, %s, %s, 429, 'failed', '54')""",
+        db.sql("""INSERT INTO refunds (refund_id, remedy_id, payment_id, attempt_no, amount_cents, status, error_code,
+                      created_at) VALUES (%s, %s, %s, %s, 429, 'failed', '54', now() - interval '10 minutes')""",
                f"rf_{oid}_{item}_missing_r{a}_old{n}", a, f"pay_{oid}_1", 100 + n)
     fake_hs.respond = lambda p: {"refund_id": p["refund_id"], "status": "pending"}
 
@@ -436,7 +437,8 @@ def test_effective_config_reports_value_and_source(monkeypatch):
     cfg = settlement.effective_config()
     assert cfg["settlement_cutoff"] == {"value": "15:00", "source": "env"}
     assert set(cfg) == {"settlement_cutoff", "settlement_timezone", "settlement_margin_hours",
-                        "refund_max_auto_attempts_per_payment", "store_timezone"}
+                        "refund_max_auto_attempts_per_payment", "refund_same_amount_spacing_seconds",
+                        "store_timezone"}
 
 
 def test_startup_log_shows_effective_values(monkeypatch, caplog):
@@ -682,3 +684,70 @@ def test_constraint_backstop_gives_the_same_clear_error(db, fake_hs, store, monk
                    json={"processor_transaction_id": txn, "note": "n"})
     assert r.status_code == 409 and r.json()["detail"] == f"This processor transaction is already recorded on remedy {rid1}."
     assert db.remedy_row(rid2)["status"] == "needs_manual_refund"
+
+
+
+# ── Authorize.net duplicate filter (error 11): same amount, same payment, 2-minute window ──
+def _sent(db, oid):
+    return db.sql("SELECT remedy_id, amount_cents, created_at FROM refunds WHERE payment_id = %s ORDER BY created_at",
+                  f"pay_{oid}_1")
+
+
+def test_same_amount_refunds_go_out_in_separate_runs_spaced_apart(db, fake_hs):
+    from app import sweep
+    from app.config import settings
+    spacing = settings.refund_same_amount_spacing_seconds
+    assert spacing >= 180
+    fake_hs.respond = lambda p: {"refund_id": p["refund_id"], "status": "pending"}
+    oid, item = db.order(captured_at=now() - timedelta(days=3))
+    a, b = db.remedy(oid, item, qty=1), db.remedy(oid, item, qty=1)          # both $4.29, both due
+    db.call(sweep._send_due_refunds)                                          # run 1
+    first = _sent(db, oid)
+    assert len(first) == 1
+    waiting = b if first[0]["remedy_id"] == a else a
+    w = db.remedy_row(waiting)
+    assert w["status"] == "awaiting_settlement" and w["next_attempt_at"] <= now()   # still due, untouched
+    db.call(sweep._send_due_refunds)                                          # run 2, moments later
+    assert len(_sent(db, oid)) == 1                                           # still held back
+    # let the spacing window pass for the first refund, then run again
+    db.sql("UPDATE refunds SET created_at = created_at - make_interval(secs => %s) WHERE payment_id = %s",
+           spacing + 1, f"pay_{oid}_1")
+    db.call(sweep._send_due_refunds)                                          # run 3
+    sent = _sent(db, oid)
+    assert len(sent) == 2 and {r["remedy_id"] for r in sent} == {a, b}
+    assert (sent[1]["created_at"] - sent[0]["created_at"]).total_seconds() >= spacing
+
+
+def test_different_amounts_go_out_in_the_same_run(db, fake_hs):
+    from app import sweep
+    fake_hs.respond = lambda p: {"refund_id": p["refund_id"], "status": "pending"}
+    oid, item = db.order(captured_at=now() - timedelta(days=3))
+    a, b = db.remedy(oid, item, qty=1), db.remedy(oid, item, qty=2)          # $4.29 and $8.58
+    db.call(sweep._send_due_refunds)
+    sent = _sent(db, oid)
+    assert len(sent) == 2 and {r["amount_cents"] for r in sent} == {429, 858}
+    assert {db.remedy_row(a)["status"], db.remedy_row(b)["status"]} == {"refund_pending"}
+
+
+def test_error_11_reschedules_soon_instead_of_manual(db, fake_hs):
+    from app import refunds
+    from app.config import settings
+    spacing = settings.refund_same_amount_spacing_seconds
+    fake_hs.respond = lambda p: {"refund_id": p["refund_id"], "status": "failed", "error_code": "11",
+                                 "error_message": "A duplicate transaction has been submitted."}
+    oid, item = db.order(captured_at=now() - timedelta(days=3))
+    rid = db.remedy(oid, item)
+    before = now()
+    db.call(refunds.start_refund, rid)
+    r = db.remedy_row(rid)
+    assert r["status"] == "awaiting_settlement" and r["last_error_code"] == "11"
+    assert before + timedelta(seconds=spacing - 1) <= r["next_attempt_at"] <= now() + timedelta(seconds=spacing + 1)
+    assert db.attempts(oid) == 1                                              # it counted as an attempt
+    # once due again, it is retried as the next attempt (still under the 4-attempt cap)
+    fake_hs.respond = lambda p: {"refund_id": p["refund_id"], "status": "succeeded"}
+    _set_next(db, rid, now() - timedelta(seconds=1))
+    db.sql("UPDATE refunds SET created_at = created_at - make_interval(secs => %s) WHERE payment_id = %s",
+           spacing + 1, f"pay_{oid}_1")
+    db.call(refunds.start_refund, rid)
+    assert db.remedy_row(rid)["status"] == "refunded" and db.attempts(oid) == 2
+    assert fake_hs.creates[-1].endswith("_a2")

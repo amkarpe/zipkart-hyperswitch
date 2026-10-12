@@ -8,6 +8,9 @@ State machine (refund remedies):
     refund_pending ──succeeded──▶ refunded
     refund_pending ──pending/review──▶ refund_pending                       (sweep GETs it; a GET is not an attempt)
     refund_pending ──failed, error 54──▶ awaiting_settlement               next_attempt_at = gate(now): next window
+    refund_pending ──failed, error 11──▶ awaiting_settlement               next_attempt_at = now + spacing (duplicate filter)
+    awaiting_settlement ──(sweep: due, but a same-amount refund on this payment was sent < spacing ago)──▶
+                          awaiting_settlement, unchanged and still due: goes out on a later run
     refund_pending ──failed, any other code──▶ needs_manual_refund
     refund_pending ──request rejected (IR_12, any other 4xx)──▶ needs_manual_refund
     refund_pending ──timeout/5xx──▶ refund_pending                          (sweep GETs; HE_02 = never received:
@@ -35,7 +38,7 @@ yet", but Authorize.net also uses it for invalid type, wrong currency, bad refer
 or >180 days. So it's treated as "next window", and the per-payment cap is the backstop.
 """
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 
@@ -48,6 +51,10 @@ from app.settlement import refund_gate
 log = logging.getLogger("zipkart.refunds")
 
 NOT_SETTLED_CODE = "54"
+# Authorize.net "A duplicate transaction has been submitted": same type, card and amount within
+# its 2-minute duplicateWindow. Hyperswitch passes the connector's errorCode through as the
+# refund's error_code (authorizedotnet/transformers.rs, refund response mapping).
+DUPLICATE_CODE = "11"
 CAPTURED = ("partially_captured", "succeeded")
 
 
@@ -67,13 +74,19 @@ def remedy_outcome(refund_status: str, error_code: str | None) -> str | None:
     if refund_status == "succeeded":
         return "refunded"
     if refund_status == "failed":
-        return "awaiting_settlement" if error_code == NOT_SETTLED_CODE else "needs_manual_refund"
+        return "awaiting_settlement" if error_code in (NOT_SETTLED_CODE, DUPLICATE_CODE) else "needs_manual_refund"
     return None   # pending / review: still in flight
 
 
 async def _move_remedy(conn, remedy_id: int, new: str, code: str | None, message: str | None) -> bool:
     """refund_pending -> new, with the scheduling / manual fields that state needs (CAS)."""
     now = datetime.now(timezone.utc)
+    if new != "awaiting_settlement":
+        retry_at = None
+    elif code == DUPLICATE_CODE:   # not a settlement problem: just wait out the duplicate window
+        retry_at = now + timedelta(seconds=settings.refund_same_amount_spacing_seconds)
+    else:
+        retry_at = refund_gate(now)
     cur = await conn.execute(
         """UPDATE remedies SET status = %s,
                next_attempt_at = %s,
@@ -83,7 +96,7 @@ async def _move_remedy(conn, remedy_id: int, new: str, code: str | None, message
                updated_at = now()
            WHERE id = %s AND status = 'refund_pending'""",
         (new,
-         refund_gate(now) if new == "awaiting_settlement" else None,
+         retry_at,
          f"refund failed: {code or 'unknown error'}" if new == "needs_manual_refund" else None,
          code, message, remedy_id),
     )
@@ -146,6 +159,18 @@ async def start_refund(remedy_id: int, now: datetime | None = None) -> str | Non
                 (reason, remedy_id),
             )
             log.error("remedy %s needs a manual refund: %s", remedy_id, reason)
+            return None
+
+        # Authorize.net's duplicate filter (checked after the budget, so an exhausted budget still
+        # goes to manual): don't send a refund of the same amount on the same payment within the
+        # spacing window. Leave it scheduled and due; a later sweep run sends it.
+        cur = await conn.execute(
+            "SELECT 1 FROM refunds WHERE payment_id = %s AND amount_cents = %s AND created_at > %s LIMIT 1",
+            (payment["payment_id"], remedy["amount_cents"],
+             now - timedelta(seconds=settings.refund_same_amount_spacing_seconds)),
+        )
+        if await cur.fetchone() is not None:
+            log.info("remedy %s: same-amount refund on %s sent recently; waiting", remedy_id, payment["payment_id"])
             return None
 
         attempt_no = 1 if previous is None else previous["attempt_no"] + 1
