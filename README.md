@@ -194,8 +194,8 @@ After the first deploy:
 
 **Cold starts:** Render's free tier sleeps after ~15 minutes idle; the first request after that
 takes up to a minute. Neon also scales to zero, but wakes in well under a second. While the app
-sleeps the background sweep doesn't run; it runs again on wake-up and whenever the store console
-loads, and Hyperswitch retries webhooks that arrive while the app is asleep.
+sleeps the background sweep doesn't run; it runs again on wake-up (see the external triggers under
+Known limitations).
 
 ## What the sandbox taught us (and the code relies on)
 
@@ -216,13 +216,21 @@ loads, and Hyperswitch retries webhooks that arrive while the app is asleep.
   Refunds are scheduled for the settlement window, retried only once per window on error 54, and
   capped at 4 automatic attempts per payment, because Hyperswitch refuses any refund (`IR_12`) once a
   payment has 11 on record, failed ones included. Everything else goes to *needs manual refund*.
-- **The sweep runs hourly through GitHub Actions** (`.github/workflows/sweep.yml`, minute 17).
-  Render's free tier sleeps after 15 minutes without inbound HTTP, a sleeping app runs no timer, and
-  Hyperswitch webhooks don't reliably reach it, so an external schedule calls `POST /internal/sweep`
-  (header `X-Sweep-Secret`, from the `INTERNAL_SWEEP_SECRET` repository secret). Hourly keeps it
-  within the free Actions minutes for a private repo. Scheduled refunds therefore go out within
-  about an hour of their settlement window. **The first page load after the app has slept can take
-  about a minute** while Render starts it.
+- **The app is woken from outside, twice an hour.** Render's free tier sleeps after 15 minutes
+  without inbound HTTP, and a sleeping app runs no timer. Two independent triggers wake it:
+  - **cron-job.org** sends `GET /health` at minute 47 every hour. It carries no secret: it only wakes
+    the app, and the in-app timer runs the sweep about 15 s after startup, then every 3 minutes
+    while the app is awake.
+  - **GitHub Actions** (`.github/workflows/sweep.yml`, minute 17) sends `POST /internal/sweep` with
+    the `X-Sweep-Secret` header from the `INTERNAL_SWEEP_SECRET` repository secret.
+
+  Why two: GitHub documents scheduled runs as best-effort ("can be delayed during periods of high
+  loads… some queued jobs may be dropped"), and in practice **none of the first four hourly runs
+  happened**, while manual runs of the same workflow worked. cron-job.org is also best-effort, but
+  independent. If both miss, due refunds wait for the next wake; the lease and compare-and-set
+  checks mean nothing is ever sent early or twice. Scheduled refunds go out within about an hour
+  of their settlement window. **The first page load after the app has slept can take about a
+  minute** while Render starts it.
 - **Free replacements are recorded, not fulfilled.** There's no "next order" credit system yet.
 - **No customer accounts.** Anyone with an order's link (a random 12-character ID) can view it and
   report problems on it.
@@ -232,10 +240,16 @@ loads, and Hyperswitch retries webhooks that arrive while the app is asleep.
 - **Simple tax** (8.25% on soda and paper goods only) and USD only.
 - **Holds expire** after about 7 days at most banks. Fine for same-day delivery; scheduled delivery
   would need the card saved and the authorization taken close to the delivery window.
-- **Webhooks in production** need the public URL configured in Hyperswitch (local testing used
-  correctly and incorrectly signed sample requests).
-- **Automated tests cover the webhook handler only** (`tests/`, using a real-format Hyperswitch
-  event). Everything else was tested with scripts against the sandbox and in the browser.
+- **Hyperswitch's webhook deliveries don't reach the deployed app.** The Hyperswitch dashboard
+  records every delivery to Render as `WebhookCallFailed`, and none appears in Render's logs. The
+  identical request (same body, signature and headers, replayed from a captured delivery) reaches
+  Render and returns 200 from a Mac and from cron-job.org, and Hyperswitch delivers fine to
+  webhook.site. So the failure is on the route from Hyperswitch's sandbox to Render, not in our
+  code. Webhooks are treated as hints: the return page and the sweep keep payments and refunds in
+  sync without them.
+- **Automated tests cover the webhook handler and the refund/remedy flow** (`tests/`, run against
+  the dev branch). Checkout, picking and capture were tested with scripts against the sandbox and
+  in the browser.
 
 ## Project layout
 
