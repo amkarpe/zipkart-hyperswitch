@@ -138,6 +138,7 @@ def db(app_client):
     for oid in made:
         for q in ("DELETE FROM refunds WHERE payment_id = %s",):
             DB().sql(q, f"pay_{oid}_1")
+        DB().sql("DELETE FROM remedy_schedule_changes WHERE remedy_id IN (SELECT id FROM remedies WHERE order_id = %s)", oid)
         DB().sql("DELETE FROM remedies WHERE order_id = %s", oid)
         DB().sql("DELETE FROM order_items WHERE order_id = %s", oid)
         DB().sql("DELETE FROM payments WHERE order_id = %s", oid)
@@ -460,3 +461,106 @@ def test_health_shows_effective_settlement_config(app_client):
     assert s["settlement_margin_hours"]["value"] == 6.0
     assert s["refund_max_auto_attempts_per_payment"]["value"] == 4
     assert "latest_migration" in body and "commit" in body
+
+
+
+# ── Rescheduling first attempts after a settlement-config change ────────────
+def _set_next(db, rid, when):
+    db.sql("UPDATE remedies SET next_attempt_at = %s WHERE id = %s", when, rid)
+
+
+def _changes(db, rid):
+    return db.sql("SELECT old_next_attempt_at, new_next_attempt_at, reason FROM remedy_schedule_changes "
+                  "WHERE remedy_id = %s ORDER BY id", rid)
+
+
+def test_reschedule_moves_only_zero_attempt_awaiting_remedies(db, fake_hs):
+    from app import sweep
+    from app.settlement import refund_gate
+    wrong = datetime(2026, 1, 1, tzinfo=UTC)      # a stale stored first-attempt time
+
+    ok_oid, ok_item = db.order(captured_at=now())              # zero attempts: should move
+    ok = db.remedy(ok_oid, ok_item)
+    _set_next(db, ok, wrong)
+
+    manual_oid, manual_item = _needs_manual(db, fake_hs)[0], None   # needs_manual_refund: untouched
+    manual = db.sql("SELECT id FROM remedies WHERE order_id = %s", manual_oid)[0]["id"]
+
+    repl_oid, repl_item = db.order(captured_at=now())          # replacement: never scheduled
+    from app.remedies import create_remedy
+    repl = db.call(create_remedy, repl_oid, repl_item, "damaged", "replacement", 1, "t")["id"]
+
+    moved = db.call(sweep._reschedule_first_attempts)
+    assert [int(m["remedy_id"]) for m in moved] == [ok]
+    assert db.remedy_row(ok)["next_attempt_at"] == refund_gate(db.sql("SELECT captured_at FROM orders WHERE id = %s", ok_oid)[0]["captured_at"])
+    assert db.remedy_row(manual)["status"] == "needs_manual_refund" and _changes(db, manual) == []
+    assert db.remedy_row(repl)["next_attempt_at"] is None and _changes(db, repl) == []
+
+
+def test_remedy_with_attempts_keeps_its_retry_time(db, fake_hs):
+    from app import refunds, sweep
+    fake_hs.respond = lambda p: {"refund_id": p["refund_id"], "status": "failed", "error_code": "54"}
+    oid, item = db.order(captured_at=now() - timedelta(days=3))
+    rid = db.remedy(oid, item)
+    db.call(refunds.start_refund, rid)                      # attempt 1 -> 54 -> retry time stored
+    retry_at = db.remedy_row(rid)["next_attempt_at"]
+    other = db.remedy(oid, item)                            # a second remedy on the SAME payment
+    other_at = db.remedy_row(other)["next_attempt_at"]
+    _set_next(db, other, other_at + timedelta(hours=1))      # would differ from the gate
+    db.call(sweep._reschedule_first_attempts)
+    assert db.remedy_row(rid)["next_attempt_at"] == retry_at             # retry time kept
+    assert db.remedy_row(other)["next_attempt_at"] == other_at + timedelta(hours=1)   # payment has attempts
+    assert _changes(db, rid) == [] and _changes(db, other) == []
+
+
+def test_reschedule_then_select_never_sends_at_the_old_time(db, fake_hs):
+    from app import sweep
+    oid, item = db.order(captured_at=now())        # correct gate is in the future
+    rid = db.remedy(oid, item)
+    _set_next(db, rid, now() - timedelta(hours=1))   # stale stored time: already "due"
+    result = db.call(sweep.run_sweep, "test_reschedule")
+    assert result is not None, "another sweep held the lease"
+    assert [int(r["remedy_id"]) for r in result["d1_rescheduled"]] == [rid]
+    assert fake_hs.creates == [] and result["d2_refunds_sent"] == []
+    assert db.remedy_row(rid)["next_attempt_at"] > now() and db.remedy_row(rid)["status"] == "awaiting_settlement"
+    assert list(result).index("d1_rescheduled") < list(result).index("d2_refunds_sent")
+
+
+def test_audit_entry_written_exactly_once_per_change(db, fake_hs, monkeypatch):
+    import dataclasses
+
+    from app import settlement, sweep
+    oid, item = db.order(captured_at=datetime(2026, 10, 12, 0, 10, tzinfo=LA))   # the ZK6 case
+    rid = db.remedy(oid, item)
+    wrong = datetime(2026, 10, 13, 4, 0, tzinfo=UTC)          # what the 15:00 cut-off produced
+    _set_next(db, rid, wrong)
+    for _ in range(3):                                        # repeated runs: one change, one row
+        db.call(sweep._reschedule_first_attempts)
+    rows = _changes(db, rid)
+    assert len(rows) == 1
+    assert rows[0]["old_next_attempt_at"] == wrong
+    assert rows[0]["new_next_attempt_at"] == datetime(2026, 10, 13, 5, 0, tzinfo=UTC)   # Oct 13 12:00 AM CDT
+    assert rows[0]["reason"].startswith("settlement config changed: cutoff 16:00 America/Los_Angeles")
+
+    # a later, different config change is a second change -> exactly one more row
+    monkeypatch.setattr(settlement, "settings", dataclasses.replace(settlement.settings, settlement_margin_hours=7.0))
+    db.call(sweep._reschedule_first_attempts)
+    db.call(sweep._reschedule_first_attempts)
+    rows = _changes(db, rid)
+    assert len(rows) == 2 and rows[1]["new_next_attempt_at"] == datetime(2026, 10, 13, 6, 0, tzinfo=UTC)
+    assert "margin 7h" in rows[1]["reason"]
+
+
+def test_store_console_shows_schedule_change(db, fake_hs, store):
+    from app import sweep
+    oid, item = db.order(captured_at=datetime(2026, 10, 12, 0, 10, tzinfo=LA))
+    rid = db.remedy(oid, item)
+    _set_next(db, rid, datetime(2026, 10, 13, 4, 0, tzinfo=UTC))
+    db.call(sweep._reschedule_first_attempts)
+    view = store.get(f"/store/api/orders/{oid}").json()
+    r = next(x for x in view["remedies"] if x["id"] == rid)
+    assert r["next_attempt"] == "Oct 13, 12:00 AM CDT"
+    assert r["schedule_changes"][0]["old"] == "Oct 12, 11:00 PM CDT"
+    assert r["schedule_changes"][0]["new"] == "Oct 13, 12:00 AM CDT"
+    cust = store.get(f"/api/orders/{oid}").json()
+    assert "by Oct 13" in next(x["message"] for x in cust["remedies"] if x["id"] == rid)

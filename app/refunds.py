@@ -14,6 +14,8 @@ State machine (refund remedies):
                                                                             re-send the SAME refund_id, same attempt)
     refunded, needs_manual_refund: final for automation.
     needs_manual_refund ──(store: "Mark refunded manually", txn id + note)──▶ refunded_manually   final
+    awaiting_settlement ──(sweep: config changed, no attempts on the payment)──▶ awaiting_settlement
+                          next_attempt_at = gate(captured_at) with current config; audit row written
 
 refund_id = rf_{order}_{item}_{reason}_r{remedy}_a{n}
   * deterministic, so re-sending after a timeout is safe (HE_01 -> fetch instead);
@@ -36,6 +38,7 @@ from datetime import datetime, timezone
 from app import hyperswitch as hs
 from app.config import settings
 from app.db import pool
+from app import settlement
 from app.settlement import refund_gate
 
 log = logging.getLogger("zipkart.refunds")
@@ -290,3 +293,57 @@ async def mark_refunded_manually(order_id: str, remedy_id: int, txn_id: str, not
             (txn_id, note, remedy_id, order_id),
         )
         return cur.rowcount == 1
+
+
+def reschedule_reason() -> str:
+    c = settlement.settings   # read at call time: the config in force now
+    return (f"settlement config changed: cutoff {c.settlement_cutoff} {c.settlement_timezone}, "
+            f"margin {c.settlement_margin_hours:g}h")
+
+
+async def reschedule_if_config_changed(remedy_id: int) -> dict | None:
+    """Recompute the FIRST attempt time from captured_at with the current settlement config.
+    Only for awaiting_settlement remedies on payments with zero refund attempts: once any
+    attempt exists, stored times are retry times (set from error 54) and are left alone.
+    Runs under the order-row lock, the same lock start_refund takes, so it can't interleave
+    with a send on that payment. Compare-and-set on the stored time; the audit row is written
+    in the same transaction, so there's exactly one per actual change."""
+    async with pool.connection() as conn, conn.transaction():
+        cur = await conn.execute("SELECT order_id FROM remedies WHERE id = %s", (remedy_id,))
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        cur = await conn.execute(
+            "SELECT id, captured_at FROM orders WHERE id = %s FOR UPDATE", (row["order_id"],)
+        )
+        order = await cur.fetchone()
+        cur = await conn.execute(
+            """SELECT m.next_attempt_at, m.status, m.resolution,
+                      (SELECT count(*) FROM refunds f JOIN payments p ON p.payment_id = f.payment_id
+                       WHERE p.order_id = m.order_id) AS payment_attempts
+               FROM remedies m WHERE m.id = %s""",
+            (remedy_id,),
+        )
+        m = await cur.fetchone()
+        if (m["resolution"] != "refund" or m["status"] != "awaiting_settlement" or m["payment_attempts"] > 0
+                or order["captured_at"] is None or m["next_attempt_at"] is None):
+            return None
+        new = refund_gate(order["captured_at"])
+        old = m["next_attempt_at"]
+        if new == old:
+            return None
+        cur = await conn.execute(
+            """UPDATE remedies SET next_attempt_at = %s, updated_at = now()
+               WHERE id = %s AND status = 'awaiting_settlement' AND next_attempt_at = %s""",
+            (new, remedy_id, old),
+        )
+        if cur.rowcount != 1:
+            return None
+        reason = reschedule_reason()
+        await conn.execute(
+            """INSERT INTO remedy_schedule_changes (remedy_id, old_next_attempt_at, new_next_attempt_at, reason)
+               VALUES (%s, %s, %s, %s)""",
+            (remedy_id, old, new, reason),
+        )
+    log.warning("remedy %s rescheduled %s -> %s (%s)", remedy_id, old.isoformat(), new.isoformat(), reason)
+    return {"old": old.isoformat(), "new": new.isoformat(), "reason": reason}

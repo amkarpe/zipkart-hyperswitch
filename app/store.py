@@ -125,6 +125,13 @@ async def store_view(order_id: str) -> dict:
             raise HTTPException(status_code=404, detail="Order not found.")
         remedies = await load_remedies(conn, order_id)
         used = await attempts_used(conn, order_id)
+        cur = await conn.execute(
+            """SELECT c.remedy_id, c.old_next_attempt_at, c.new_next_attempt_at, c.reason, c.changed_at
+               FROM remedy_schedule_changes c JOIN remedies m ON m.id = c.remedy_id
+               WHERE m.order_id = %s ORDER BY c.changed_at""",
+            (order_id,),
+        )
+        changes = await cur.fetchall()
     committed = ff.committed_totals(order, items)
     capturable = payment["amount_capturable_cents"] if payment and payment["status"] == "requires_capture" else None
     lines = []
@@ -176,6 +183,12 @@ async def store_view(order_id: str) -> dict:
             "manual_refund_txn_id": r["manual_refund_txn_id"],
             "manual_refund_note": r["manual_refund_note"],
             "manual_refunded_at": store_time(r["manual_refunded_at"]) if r["manual_refunded_at"] else None,
+            "schedule_changes": [{
+                "changed_at": store_time(c["changed_at"]),
+                "old": store_time(c["old_next_attempt_at"]),
+                "new": store_time(c["new_next_attempt_at"]),
+                "reason": c["reason"],
+            } for c in changes if c["remedy_id"] == r["id"]],
         } for r in remedies],
         "server_time": datetime.now(timezone.utc).isoformat(),
     }

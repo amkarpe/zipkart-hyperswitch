@@ -178,7 +178,10 @@ wait until `/health` reports the new commit (`RENDER_GIT_COMMIT`) before treatin
 deliberately doesn't set them (a copy there once said 15:00 while the code said 16:00, and refunds
 were scheduled an hour early). An env var on the service still overrides the default, and a
 service value beats an environment group. `/health` and the startup log show each effective value
-and whether it came from `env` or `default`, so check them after every deploy.
+and whether it came from `env` or `default`, so check them after every deploy. If the settlement
+config changes, each sweep re-computes the first attempt time of scheduled refunds on payments with
+no refund attempts yet (before it selects anything to send), and records every change (old time,
+new time, reason) in `remedy_schedule_changes`, shown on the remedy in the store console.
 
 After the first deploy:
 1. Copy the service URL from the Render dashboard **exactly** (Render may add a suffix such as

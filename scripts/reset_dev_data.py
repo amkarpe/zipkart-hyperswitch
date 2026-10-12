@@ -6,7 +6,8 @@ retry, a cancel) acted on them, two systems would act on the same sandbox paymen
 with its own attempt count. This removes that copied payment state.
 
 Deletes (everything that hangs off orders, plus copied webhook traffic):
-    refunds, remedies, order_items, payments, orders     (the foreign-key chain)
+    refunds, remedy_schedule_changes, remedies,
+    order_items, payments, orders                        (the foreign-key chain)
     webhook_events, webhook_failures                     (no FKs, but copies of production
                                                           deliveries for real payment/refund IDs)
 Resets, not deletes:
@@ -29,7 +30,7 @@ import psycopg
 from app.config import settings
 from app.dbguard import assert_not_production
 
-DELETE_ORDER = ["refunds", "remedies", "order_items", "payments", "orders", "webhook_events", "webhook_failures"]
+DELETE_ORDER = ["refunds", "remedy_schedule_changes", "remedies", "order_items", "payments", "orders", "webhook_events", "webhook_failures"]
 RESET = ["sweep_lease"]
 KEEP = ["products", "schema_migrations"]
 

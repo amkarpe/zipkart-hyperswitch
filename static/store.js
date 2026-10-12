@@ -238,6 +238,8 @@ function remediesPanel(v) {
       details.append(el("div", {}, `Refunded manually ${r.manual_refunded_at}`),
         el("div", { class: "muted" }, `Processor transaction ID: ${r.manual_refund_txn_id}`),
         el("div", { class: "muted" }, `Note: ${r.manual_refund_note}`));
+    for (const c of r.schedule_changes || [])
+      details.append(el("div", { class: "muted" }, `Rescheduled ${c.changed_at}: ${c.old} → ${c.new} (${c.reason})`));
     if (r.last_error) details.append(el("div", { class: "muted" }, `Last processor response: ${r.last_error}`));
     if (r.note) details.append(el("div", { class: "muted" }, `Customer note: “${r.note}”`));
     table.append(el("tr", {},

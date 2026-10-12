@@ -10,7 +10,8 @@ action whose intent is already committed. Nothing is retried blindly.
      closed the tab before the return page, with the webhook lost)
   b. finish orders stuck in 'cancelling'
   c. void inactive payment attempts that still hold funds
-  d. send refunds whose settlement window has come (next_attempt_at <= now)
+  d1. reschedule first refund attempts if the settlement config changed (audited)
+  d2. send refunds whose settlement window has come (next_attempt_at <= now)
   e. check pending refunds (and repair remedies whose refund is already final)
 
 Only one sweep runs at a time: a lease row taken with compare-and-set. (A Postgres
@@ -137,7 +138,26 @@ async def _void_inactive_holds() -> list[dict]:
     return await _each("void", rows, void)
 
 
-# d ──────────────────────────────────────────────────────────────────────────
+# d1 ─────────────────────────────────────────────────────────────────────────
+async def _reschedule_first_attempts() -> list[dict]:
+    """Before anything is sent: bring first-attempt times in line with the current settlement
+    config. Runs earlier in the same run (and lease) as _send_due_refunds, so a refund is
+    never sent on a time that this run is about to correct."""
+    rows = await _rows(
+        """SELECT m.id AS remedy_id FROM remedies m
+           WHERE m.resolution = 'refund' AND m.status = 'awaiting_settlement'
+             AND NOT EXISTS (SELECT 1 FROM refunds f JOIN payments p ON p.payment_id = f.payment_id
+                             WHERE p.order_id = m.order_id)
+           ORDER BY m.id LIMIT 500""",
+    )
+
+    async def check(row):
+        change = await refunds.reschedule_if_config_changed(row["remedy_id"])
+        return None if change is None else f"{change['old']} -> {change['new']}"
+    return await _each("reschedule", rows, check)
+
+
+# d2 ─────────────────────────────────────────────────────────────────────────
 async def _send_due_refunds() -> list[dict]:
     """The only place a refund is sent: remedies whose settlement window has come.
     start_refund re-checks due-ness and the per-payment budget under the order lock."""
@@ -189,7 +209,8 @@ async def run_sweep(trigger: str) -> dict | None:
         result["a_payments_synced"] = await _sync_stale_payments()
         result["b_cancelling_finished"] = await _finish_cancelling()
         result["c_stray_holds_voided"] = await _void_inactive_holds()
-        result["d_refunds_sent"] = await _send_due_refunds()
+        result["d1_rescheduled"] = await _reschedule_first_attempts()   # always before d2
+        result["d2_refunds_sent"] = await _send_due_refunds()
         result["e_refunds_checked"] = await _check_pending_refunds()
     finally:
         result["seconds"] = round((datetime.now(timezone.utc) - started).total_seconds(), 1)
@@ -199,7 +220,7 @@ async def run_sweep(trigger: str) -> dict | None:
                    WHERE id = 1 AND owner = %s""",
                 (json.dumps(result), f"{_OWNER}:{trigger}"),
             )
-    changes = sum(len(v) for k, v in result.items() if k[:2] in ("a_", "b_", "c_", "d_", "e_"))
+    changes = sum(len(v) for v in result.values() if isinstance(v, list))
     log.info("sweep (%s) done in %ss, %s change(s)", trigger, result["seconds"], changes)
     return result
 
