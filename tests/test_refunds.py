@@ -139,6 +139,7 @@ def db(app_client):
         for q in ("DELETE FROM refunds WHERE payment_id = %s",):
             DB().sql(q, f"pay_{oid}_1")
         DB().sql("DELETE FROM remedy_schedule_changes WHERE remedy_id IN (SELECT id FROM remedies WHERE order_id = %s)", oid)
+        DB().sql("DELETE FROM remedy_txn_corrections WHERE remedy_id IN (SELECT id FROM remedies WHERE order_id = %s)", oid)
         DB().sql("DELETE FROM remedies WHERE order_id = %s", oid)
         DB().sql("DELETE FROM order_items WHERE order_id = %s", oid)
         DB().sql("DELETE FROM payments WHERE order_id = %s", oid)
@@ -564,3 +565,91 @@ def test_store_console_shows_schedule_change(db, fake_hs, store):
     assert r["schedule_changes"][0]["new"] == "Oct 13, 12:00 AM CDT"
     cust = store.get(f"/api/orders/{oid}").json()
     assert "by Oct 13" in next(x["message"] for x in cust["remedies"] if x["id"] == rid)
+
+
+
+# ── Processor references on manual refunds: unique, and correctable with history ──
+def _manually_refunded(db, fake_hs, store, txn):
+    oid, rid = _needs_manual(db, fake_hs)
+    r = store.post(f"/store/api/orders/{oid}/remedies/{rid}/mark-refunded",
+                   json={"processor_transaction_id": txn, "note": "refunded in Authorize.net"})
+    assert r.status_code == 200, r.text
+    return oid, rid
+
+
+def _txn(prefix="8006"):
+    return prefix + secrets.token_hex(4)
+
+
+def test_duplicate_processor_txn_is_rejected(db, fake_hs, store):
+    txn = _txn()
+    _oid1, rid1 = _manually_refunded(db, fake_hs, store, txn)
+    oid2, rid2 = _needs_manual(db, fake_hs)
+    r = store.post(f"/store/api/orders/{oid2}/remedies/{rid2}/mark-refunded",
+                   json={"processor_transaction_id": f"  {txn} ", "note": "oops, same id"})
+    assert r.status_code == 409
+    assert r.json()["detail"] == f"This processor transaction is already recorded on remedy {rid1}."
+    assert db.remedy_row(rid2)["status"] == "needs_manual_refund" and db.remedy_row(rid2)["manual_refund_txn_id"] is None
+
+
+def test_correction_writes_one_history_row_and_updates_reference(db, fake_hs, store):
+    wrong, right = _txn(), _txn()
+    oid, rid = _manually_refunded(db, fake_hs, store, wrong)
+    url = f"/store/api/orders/{oid}/remedies/{rid}/correct-txn"
+    r = store.post(url, json={"processor_transaction_id": right, "reason": "entered remedy 15's refund by mistake"})
+    assert r.status_code == 200, r.text
+    row = db.remedy_row(rid)
+    assert (row["status"], row["manual_refund_txn_id"]) == ("refunded_manually", right)   # status unchanged
+    hist = db.sql("SELECT old_txn_id, new_txn_id, reason FROM remedy_txn_corrections WHERE remedy_id = %s", rid)
+    assert hist == [{"old_txn_id": wrong, "new_txn_id": right, "reason": "entered remedy 15's refund by mistake"}]
+    # repeating the same correction is refused and writes nothing more
+    again = store.post(url, json={"processor_transaction_id": right, "reason": "again"})
+    assert again.status_code == 409
+    assert db.sql("SELECT count(*) AS n FROM remedy_txn_corrections WHERE remedy_id = %s", rid)[0]["n"] == 1
+    # shown on the console row
+    view = store.get(f"/store/api/orders/{oid}").json()
+    shown = next(x for x in view["remedies"] if x["id"] == rid)["txn_corrections"]
+    assert [(t["old"], t["new"]) for t in shown] == [(wrong, right)]
+
+
+def test_correction_cannot_create_a_duplicate(db, fake_hs, store):
+    taken, mine = _txn(), _txn()
+    _oid1, rid1 = _manually_refunded(db, fake_hs, store, taken)
+    oid2, rid2 = _manually_refunded(db, fake_hs, store, mine)
+    r = store.post(f"/store/api/orders/{oid2}/remedies/{rid2}/correct-txn",
+                   json={"processor_transaction_id": taken, "reason": "wrong one"})
+    assert r.status_code == 409 and r.json()["detail"] == f"This processor transaction is already recorded on remedy {rid1}."
+    assert db.remedy_row(rid2)["manual_refund_txn_id"] == mine
+    assert db.sql("SELECT count(*) AS n FROM remedy_txn_corrections WHERE remedy_id = %s", rid2)[0]["n"] == 0
+
+
+def test_correction_requires_id_and_reason_and_a_manual_refund(db, fake_hs, store):
+    oid, rid = _manually_refunded(db, fake_hs, store, _txn())
+    url = f"/store/api/orders/{oid}/remedies/{rid}/correct-txn"
+    assert store.post(url, json={"processor_transaction_id": "", "reason": "r"}).status_code == 422
+    assert store.post(url, json={"processor_transaction_id": "x", "reason": ""}).status_code == 422
+    oid2, rid2 = _needs_manual(db, fake_hs)                     # not refunded_manually yet
+    r = store.post(f"/store/api/orders/{oid2}/remedies/{rid2}/correct-txn",
+                   json={"processor_transaction_id": "x1", "reason": "r"})
+    assert r.status_code == 409
+
+
+def test_concurrent_records_of_the_same_txn_only_one_wins(db, fake_hs):
+    import asyncio
+
+    from app import refunds
+    from app.refunds import RefundError
+    txn = _txn()
+    (oid1, rid1), (oid2, rid2) = _needs_manual(db, fake_hs), _needs_manual(db, fake_hs)
+
+    async def both():
+        async def one(oid, rid):
+            try:
+                return await refunds.mark_refunded_manually(oid, rid, txn, "n")
+            except RefundError as exc:
+                return exc.message
+        return await asyncio.gather(one(oid1, rid1), one(oid2, rid2))
+    results = db.call(both)
+    assert sorted(map(str, results))[0].startswith("This processor transaction is already recorded on remedy")
+    assert results.count(True) == 1
+    assert db.sql("SELECT count(*) AS n FROM remedies WHERE manual_refund_txn_id = %s", txn)[0]["n"] == 1

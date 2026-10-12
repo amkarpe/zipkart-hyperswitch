@@ -234,10 +234,14 @@ function remediesPanel(v) {
         el("strong", {}, "Refund this manually"), ` in the Authorize.net dashboard: ${r.manual_reason}`));
       details.append(manualRefundForm(r));
     }
-    if (r.status === "refunded_manually")
+    if (r.status === "refunded_manually") {
       details.append(el("div", {}, `Refunded manually ${r.manual_refunded_at}`),
         el("div", { class: "muted" }, `Processor transaction ID: ${r.manual_refund_txn_id}`),
         el("div", { class: "muted" }, `Note: ${r.manual_refund_note}`));
+      for (const t of r.txn_corrections || [])
+        details.append(el("div", { class: "muted" }, `Reference corrected ${t.corrected_at}: ${t.old} → ${t.new} (${t.reason})`));
+      details.append(txnCorrectionForm(r));
+    }
     for (const c of r.schedule_changes || [])
       details.append(el("div", { class: "muted" }, `Rescheduled ${c.changed_at}: ${c.old} → ${c.new} (${c.reason})`));
     if (r.last_error) details.append(el("div", { class: "muted" }, `Last processor response: ${r.last_error}`));
@@ -263,6 +267,19 @@ function manualRefundForm(r) {
         "Recorded as refunded manually.");
   } }, "Mark refunded manually");
   return el("div", { class: "inline", style: "margin-top:6px" }, txn, note, btn);
+}
+
+function txnCorrectionForm(r) {
+  const txn = el("input", { type: "text", maxlength: "100", placeholder: "Correct processor transaction ID", "aria-label": "Correct processor transaction ID" });
+  const reason = el("input", { type: "text", maxlength: "500", placeholder: "Reason", "aria-label": "Reason for correction" });
+  const btn = el("button", { onclick: () => {
+    if (!txn.value.trim() || !reason.value.trim()) { alert("The corrected ID and a reason are both required."); return; }
+    if (!confirm(`Change the processor reference from ${r.manual_refund_txn_id} to ${txn.value.trim()}?`)) return;
+    act(api(`/remedies/${r.id}/correct-txn`, { processor_transaction_id: txn.value.trim(), reason: reason.value.trim() }),
+        "Processor reference corrected.");
+  } }, "Correct processor reference");
+  return el("details", { style: "margin-top:6px" }, el("summary", { class: "muted" }, "Correct processor reference"),
+    el("div", { class: "inline", style: "margin-top:6px" }, txn, reason, btn));
 }
 
 function kpi(label, value) {

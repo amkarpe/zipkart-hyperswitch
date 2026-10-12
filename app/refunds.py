@@ -14,6 +14,8 @@ State machine (refund remedies):
                                                                             re-send the SAME refund_id, same attempt)
     refunded, needs_manual_refund: final for automation.
     needs_manual_refund ──(store: "Mark refunded manually", txn id + note)──▶ refunded_manually   final
+    refunded_manually ──(store: "Correct processor reference", new id + reason)──▶ refunded_manually
+                        (status unchanged; old/new/reason recorded in remedy_txn_corrections)
     awaiting_settlement ──(sweep: config changed, no attempts on the payment)──▶ awaiting_settlement
                           next_attempt_at = gate(captured_at) with current config; audit row written
 
@@ -34,6 +36,8 @@ or >180 days. So it's treated as "next window", and the per-payment cap is the b
 """
 import logging
 from datetime import datetime, timezone
+
+import psycopg
 
 from app import hyperswitch as hs
 from app.config import settings
@@ -279,20 +283,92 @@ async def attempts_used(conn, order_id: str) -> int:
     return (await cur.fetchone())["n"]
 
 
+async def _lock_txn_id(conn, txn_id: str) -> None:
+    # Serialize every write of this processor transaction ID (transaction-scoped, so it works
+    # through Neon's PgBouncer pooler). Two shoppers recording the same ID can't both pass the
+    # "is it already recorded?" check, even across different orders.
+    await conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"manual_refund_txn:{txn_id}",))
+
+
+async def _txn_owner(conn, txn_id: str, exclude_remedy: int) -> int | None:
+    cur = await conn.execute(
+        "SELECT id FROM remedies WHERE manual_refund_txn_id = %s AND id <> %s ORDER BY id LIMIT 1",
+        (txn_id, exclude_remedy),
+    )
+    row = await cur.fetchone()
+    return row["id"] if row else None
+
+
+def _duplicate_error(owner: int) -> RefundError:
+    return RefundError(f"This processor transaction is already recorded on remedy {owner}.", 409)
+
+
 async def mark_refunded_manually(order_id: str, remedy_id: int, txn_id: str, note: str) -> bool:
     """needs_manual_refund -> refunded_manually (CAS). False if the remedy isn't waiting
-    for a manual refund (already resolved, or not on this order)."""
+    for a manual refund (already resolved, or not on this order). A processor refund can
+    belong to only one remedy."""
     txn_id, note = txn_id.strip(), note.strip()
     if not txn_id or not note:
         raise RefundError("Processor transaction ID and a note are both required.", 400)
-    async with pool.connection() as conn:
-        cur = await conn.execute(
-            """UPDATE remedies SET status = 'refunded_manually', manual_refund_txn_id = %s,
-                   manual_refund_note = %s, manual_refunded_at = now(), updated_at = now()
-               WHERE id = %s AND order_id = %s AND status = 'needs_manual_refund'""",
-            (txn_id, note, remedy_id, order_id),
-        )
-        return cur.rowcount == 1
+    try:
+        async with pool.connection() as conn, conn.transaction():
+            await _lock_txn_id(conn, txn_id)
+            owner = await _txn_owner(conn, txn_id, remedy_id)
+            if owner is not None:
+                raise _duplicate_error(owner)
+            cur = await conn.execute(
+                """UPDATE remedies SET status = 'refunded_manually', manual_refund_txn_id = %s,
+                       manual_refund_note = %s, manual_refunded_at = now(), updated_at = now()
+                   WHERE id = %s AND order_id = %s AND status = 'needs_manual_refund'""",
+                (txn_id, note, remedy_id, order_id),
+            )
+            return cur.rowcount == 1
+    except psycopg.errors.UniqueViolation:   # the database constraint (migration 012) as backstop
+        async with pool.connection() as conn:
+            raise _duplicate_error(await _txn_owner(conn, txn_id, remedy_id))
+
+
+async def correct_manual_refund_txn(order_id: str, remedy_id: int, new_txn_id: str, reason: str) -> dict:
+    """Fix a mis-entered processor transaction ID on a refunded_manually remedy. Keeps the
+    status; records old, new, reason and time in remedy_txn_corrections (same transaction)."""
+    new_txn_id, reason = new_txn_id.strip(), reason.strip()
+    if not new_txn_id or not reason:
+        raise RefundError("The corrected processor transaction ID and a reason are both required.", 400)
+    try:
+        async with pool.connection() as conn, conn.transaction():
+            await _lock_txn_id(conn, new_txn_id)
+            cur = await conn.execute(
+                "SELECT status, manual_refund_txn_id FROM remedies WHERE id = %s AND order_id = %s FOR UPDATE",
+                (remedy_id, order_id),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                raise RefundError("Remedy not found on this order.", 404)
+            if row["status"] != "refunded_manually":
+                raise RefundError("Only a manually refunded remedy has a processor reference to correct.", 409)
+            old = row["manual_refund_txn_id"]
+            if new_txn_id == old:
+                raise RefundError("That's already the recorded processor transaction ID.", 409)
+            owner = await _txn_owner(conn, new_txn_id, remedy_id)
+            if owner is not None:
+                raise _duplicate_error(owner)
+            cur = await conn.execute(
+                """UPDATE remedies SET manual_refund_txn_id = %s, updated_at = now()
+                   WHERE id = %s AND status = 'refunded_manually' AND manual_refund_txn_id = %s""",
+                (new_txn_id, remedy_id, old),
+            )
+            if cur.rowcount != 1:
+                raise RefundError("That record changed; refresh and try again.", 409)
+            await conn.execute(
+                """INSERT INTO remedy_txn_corrections (remedy_id, old_txn_id, new_txn_id, reason)
+                   VALUES (%s, %s, %s, %s)""",
+                (remedy_id, old, new_txn_id, reason),
+            )
+    except psycopg.errors.UniqueViolation:
+        async with pool.connection() as conn:
+            raise _duplicate_error(await _txn_owner(conn, new_txn_id, remedy_id))
+    log.warning("remedy %s processor reference corrected %s -> %s (%s)", remedy_id, old, new_txn_id, reason)
+    return {"old": old, "new": new_txn_id}
 
 
 def reschedule_reason() -> str:

@@ -22,7 +22,7 @@ from app import fulfillment as ff
 from app import sweep
 from app.config import settings
 from app.db import pool
-from app.refunds import RefundError, attempts_used, mark_refunded_manually
+from app.refunds import RefundError, attempts_used, correct_manual_refund_txn, mark_refunded_manually
 from app.settlement import store_time
 from app.views import _item_view, _seconds_left, hold_breakdown, load_order, load_remedies
 
@@ -132,6 +132,13 @@ async def store_view(order_id: str) -> dict:
             (order_id,),
         )
         changes = await cur.fetchall()
+        cur = await conn.execute(
+            """SELECT t.remedy_id, t.old_txn_id, t.new_txn_id, t.reason, t.corrected_at
+               FROM remedy_txn_corrections t JOIN remedies m ON m.id = t.remedy_id
+               WHERE m.order_id = %s ORDER BY t.corrected_at""",
+            (order_id,),
+        )
+        corrections = await cur.fetchall()
     committed = ff.committed_totals(order, items)
     capturable = payment["amount_capturable_cents"] if payment and payment["status"] == "requires_capture" else None
     lines = []
@@ -189,6 +196,10 @@ async def store_view(order_id: str) -> dict:
                 "new": store_time(c["new_next_attempt_at"]),
                 "reason": c["reason"],
             } for c in changes if c["remedy_id"] == r["id"]],
+            "txn_corrections": [{
+                "corrected_at": store_time(t["corrected_at"]), "old": t["old_txn_id"],
+                "new": t["new_txn_id"], "reason": t["reason"],
+            } for t in corrections if t["remedy_id"] == r["id"]],
         } for r in remedies],
         "server_time": datetime.now(timezone.utc).isoformat(),
     }
@@ -277,4 +288,18 @@ async def mark_refunded(order_id: str, remedy_id: int, body: ManualRefund):
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
     if not done:
         raise HTTPException(status_code=409, detail="That refund isn't waiting for a manual refund (already resolved?).")
+    return await store_view(order_id)
+
+
+class TxnCorrection(BaseModel):
+    processor_transaction_id: str = Field(min_length=1, max_length=100)
+    reason: str = Field(min_length=1, max_length=500)
+
+
+@router.post("/store/api/orders/{order_id}/remedies/{remedy_id}/correct-txn", dependencies=[Depends(require_store)])
+async def correct_txn(order_id: str, remedy_id: int, body: TxnCorrection):
+    try:
+        await correct_manual_refund_txn(order_id, remedy_id, body.processor_transaction_id, body.reason)
+    except RefundError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
     return await store_view(order_id)
