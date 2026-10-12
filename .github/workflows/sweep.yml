@@ -1,0 +1,35 @@
+# Wakes the Render app every hour and runs the reconciliation sweep.
+# Render's free tier sleeps after 15 minutes without inbound HTTP, a sleeping app runs
+# no timer, and webhooks don't reach it reliably, so scheduled refunds and recoveries
+# need an external trigger. Hourly keeps this inside the free Actions quota.
+name: Reconciliation sweep
+
+on:
+  schedule:
+    - cron: "17 * * * *"     # minute 17: away from the top-of-hour Actions backlog
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: POST /internal/sweep
+        env:
+          SWEEP_SECRET: ${{ secrets.INTERNAL_SWEEP_SECRET }}
+          SWEEP_URL: https://zipkart-eiwx.onrender.com/internal/sweep
+        run: |
+          # The secret is only ever passed as a header from the env var; it's never echoed.
+          # --max-time 90 covers a cold start (~1 min). --retry covers timeouts and transient
+          # 408/429/5xx only; a 401 (wrong secret) fails at once instead of being retried.
+          curl --silent --show-error --fail-with-body \
+               --max-time 90 --retry 3 --retry-delay 15 \
+               -X POST "$SWEEP_URL" \
+               -H "X-Sweep-Secret: ${SWEEP_SECRET}"
+          echo

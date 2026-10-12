@@ -176,7 +176,7 @@ function renderRemedies(order) {
   list.replaceChildren();
   for (const r of order.remedies) {
     const what = r.quantity ? `${r.item_name} × ${r.quantity}` : r.item_name;
-    const cls = r.status === "refunded" || r.status === "replacement_scheduled" ? "" : r.status === "failed" ? "bad" : "warn";
+    const cls = ["refunded", "refunded_manually", "replacement_scheduled"].includes(r.status) ? "" : "warn";
     list.append(el("div", { class: "change" },
       el("div", { class: "row" }, el("strong", {}, `${REASONS[r.reason]}: ${what}`),
         el("span", { class: `pill ${cls}` }, r.resolution === "refund" ? money(r.amount_cents) : "Replacement")),

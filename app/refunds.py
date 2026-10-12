@@ -13,6 +13,7 @@ State machine (refund remedies):
     refund_pending ──timeout/5xx──▶ refund_pending                          (sweep GETs; HE_02 = never received:
                                                                             re-send the SAME refund_id, same attempt)
     refunded, needs_manual_refund: final for automation.
+    needs_manual_refund ──(store: "Mark refunded manually", txn id + note)──▶ refunded_manually   final
 
 refund_id = rf_{order}_{item}_{reason}_r{remedy}_a{n}
   * deterministic, so re-sending after a timeout is safe (HE_01 -> fetch instead);
@@ -273,3 +274,19 @@ async def attempts_used(conn, order_id: str) -> int:
         (order_id,),
     )
     return (await cur.fetchone())["n"]
+
+
+async def mark_refunded_manually(order_id: str, remedy_id: int, txn_id: str, note: str) -> bool:
+    """needs_manual_refund -> refunded_manually (CAS). False if the remedy isn't waiting
+    for a manual refund (already resolved, or not on this order)."""
+    txn_id, note = txn_id.strip(), note.strip()
+    if not txn_id or not note:
+        raise RefundError("Processor transaction ID and a note are both required.", 400)
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """UPDATE remedies SET status = 'refunded_manually', manual_refund_txn_id = %s,
+                   manual_refund_note = %s, manual_refunded_at = now(), updated_at = now()
+               WHERE id = %s AND order_id = %s AND status = 'needs_manual_refund'""",
+            (txn_id, note, remedy_id, order_id),
+        )
+        return cur.rowcount == 1

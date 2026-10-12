@@ -36,6 +36,18 @@ class Settings:
     refund_max_auto_attempts_per_payment: int
     store_timezone: str
     internal_sweep_secret: str    # empty = POST /internal/sweep disabled
+    sweep_timer_enabled: bool     # background timer + sweep-on-console-load
+
+
+def _sweep_timer_enabled() -> bool:
+    """Automatic sweeps act on real (sandbox) payments, so they run only where this database
+    owns its payments. SWEEP_TIMER_ENABLED decides when set; if unset, the timer is on only on
+    Render (RENDER=true is set by Render on every service), so production keeps it and a
+    local app against the dev branch doesn't."""
+    raw = os.environ.get("SWEEP_TIMER_ENABLED", "").strip().lower()
+    if raw:
+        return raw in ("1", "true", "yes", "on")
+    return os.environ.get("RENDER") == "true"
 
 
 def load_settings() -> Settings:
@@ -63,6 +75,7 @@ def load_settings() -> Settings:
         refund_max_auto_attempts_per_payment=int(os.environ.get("REFUND_MAX_AUTO_ATTEMPTS_PER_PAYMENT", "4")),
         store_timezone=os.environ.get("STORE_TIMEZONE", "America/Chicago").strip(),
         internal_sweep_secret=os.environ.get("INTERNAL_SWEEP_SECRET", "").strip(),
+        sweep_timer_enabled=_sweep_timer_enabled(),
     )
 
 

@@ -22,7 +22,7 @@ from app import fulfillment as ff
 from app import sweep
 from app.config import settings
 from app.db import pool
-from app.refunds import attempts_used
+from app.refunds import RefundError, attempts_used, mark_refunded_manually
 from app.settlement import store_time
 from app.views import _item_view, _seconds_left, hold_breakdown, load_order, load_remedies
 
@@ -95,9 +95,10 @@ _background: set[asyncio.Task] = set()
 async def queue():
     # The console loading is a good moment to reconcile (the timer doesn't run while
     # Render's free instance sleeps). Fire and forget; at most once a minute.
-    task = asyncio.create_task(sweep.sweep_if_stale("store_console"))
-    _background.add(task)
-    task.add_done_callback(_background.discard)
+    if settings.sweep_timer_enabled:   # automatic, so same gate as the timer
+        task = asyncio.create_task(sweep.sweep_if_stale("store_console"))
+        _background.add(task)
+        task.add_done_callback(_background.discard)
     async with pool.connection() as conn:
         cur = await conn.execute(
             """SELECT o.id, o.status, o.customer_name, o.hold_amount_cents, o.estimated_total_cents,
@@ -172,6 +173,9 @@ async def store_view(order_id: str) -> dict:
             "next_attempt": store_time(r["next_attempt_at"]) if r["next_attempt_at"] else None,
             "manual_reason": r["manual_reason"],
             "last_error": (f"{r['last_error_code']}: {r['last_error_message']}" if r["last_error_code"] else None),
+            "manual_refund_txn_id": r["manual_refund_txn_id"],
+            "manual_refund_note": r["manual_refund_note"],
+            "manual_refunded_at": store_time(r["manual_refunded_at"]) if r["manual_refunded_at"] else None,
         } for r in remedies],
         "server_time": datetime.now(timezone.utc).isoformat(),
     }
@@ -245,3 +249,19 @@ async def sweep_now():
     if result is None:
         raise HTTPException(status_code=409, detail="A sweep is already running; try again in a moment.")
     return await sweep.last_run()
+
+
+class ManualRefund(BaseModel):
+    processor_transaction_id: str = Field(min_length=1, max_length=100)
+    note: str = Field(min_length=1, max_length=500)
+
+
+@router.post("/store/api/orders/{order_id}/remedies/{remedy_id}/mark-refunded", dependencies=[Depends(require_store)])
+async def mark_refunded(order_id: str, remedy_id: int, body: ManualRefund):
+    try:
+        done = await mark_refunded_manually(order_id, remedy_id, body.processor_transaction_id, body.note)
+    except RefundError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+    if not done:
+        raise HTTPException(status_code=409, detail="That refund isn't waiting for a manual refund (already resolved?).")
+    return await store_view(order_id)

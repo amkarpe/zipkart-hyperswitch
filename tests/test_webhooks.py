@@ -88,18 +88,42 @@ def test_malformed_payloads_raise_malformed(body, reason):
 
 
 # ── Through the HTTP handler (needs the database) ───────────────────────────
+# HTTP tests use the real event shape with a SYNTHETIC payment id that only exists for the
+# duration of the tests: the dev database must never hold real payment state.
+TEST_PAYMENT = "pay_ZKTWEBHOOK01_1"
+SYNTHETIC = REAL.replace(b"pay_ZKVGFJ63WS26_1", TEST_PAYMENT.encode())
+
+
 @pytest.fixture(scope="module")
 def client(app_client):
-    from app import hyperswitch as hs
+    import psycopg
 
-    async def fake_retrieve_payment(payment_id):   # Hyperswitch GET -> the fixture's own object
-        obj = json.loads(REAL)["content"]["object"]
+    from app import hyperswitch as hs
+    from app.config import settings
+
+    async def fake_retrieve_payment(payment_id):   # Hyperswitch GET -> the event's own object
+        obj = json.loads(SYNTHETIC)["content"]["object"]
         assert payment_id == obj["payment_id"]
         return obj
 
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(hs, "retrieve_payment", fake_retrieve_payment)
-        yield app_client
+    oid = TEST_PAYMENT[4:-2]
+    with psycopg.connect(settings.database_url, prepare_threshold=None) as conn:
+        conn.execute("""INSERT INTO orders (id, status, currency, customer_name, customer_email, customer_phone,
+                            ship_line1, ship_city, ship_state, ship_zip, subtotal_cents, tax_cents, delivery_fee_cents,
+                            estimated_total_cents, hold_amount_cents, final_amount_cents, captured_amount_cents,
+                            weight_buffer_percent)
+                        VALUES (%s, 'captured', 'USD', 'Test', 't@example.com', '5555550100', '1 Test St', 'Austin',
+                                'TX', '78701', 1000, 0, 399, 1399, 1500, 1399, 1399, 15)""", (oid,))
+        conn.execute("""INSERT INTO payments (payment_id, order_id, attempt_no, amount_cents, status)
+                        VALUES (%s, %s, 1, 1500, 'partially_captured')""", (TEST_PAYMENT, oid))
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(hs, "retrieve_payment", fake_retrieve_payment)
+            yield app_client
+    finally:
+        with psycopg.connect(settings.database_url, prepare_threshold=None) as conn:
+            conn.execute("DELETE FROM payments WHERE order_id = %s", (oid,))
+            conn.execute("DELETE FROM orders WHERE id = %s", (oid,))
 
 
 @pytest.fixture
@@ -126,7 +150,7 @@ def post(client, body: bytes, signature: str | None = "valid"):
 
 def test_real_payload_is_processed_then_deduped(client, event_ids):
     event_ids.append(eid := f"evt_test_{uuid.uuid4().hex}")
-    body = with_event_id(REAL, eid)
+    body = with_event_id(SYNTHETIC, eid)
     first = post(client, body)
     assert first.status_code == 200, first.text
     assert first.json()["status"].startswith("synced payment")
@@ -137,7 +161,7 @@ def test_real_payload_is_processed_then_deduped(client, event_ids):
 def test_nul_escape_in_payload_is_stored_not_500(client, event_ids):
     # Old handler: JSONB insert raised UntranslatableCharacter -> 500.
     event_ids.append(eid := f"evt_test_{uuid.uuid4().hex}")
-    body = with_event_id(REAL, eid).replace(b'"description":"', b'"description":"\\u0000', 1)
+    body = with_event_id(SYNTHETIC, eid).replace(b'"description":"', b'"description":"\\u0000', 1)
     assert b"\\u0000" in body
     r = post(client, body)
     assert r.status_code == 200, r.text
@@ -198,7 +222,7 @@ def test_parses_real_refund_failed_54():
     assert obj["error_code"] == "54" and obj["unified_code"] == "UE_4000" and obj["connector"] == "authorizedotnet"
 
 
-def test_real_delivery_with_real_headers_through_handler(client, monkeypatch):
+def test_real_delivery_with_real_headers_through_handler(client, monkeypatch, event_ids):
     from app import hyperswitch as hs
 
     async def fake_retrieve_refund(refund_id):
@@ -206,6 +230,7 @@ def test_real_delivery_with_real_headers_through_handler(client, monkeypatch):
     monkeypatch.setattr(hs, "retrieve_refund", fake_retrieve_refund)
     r = client.post("/webhooks/hyperswitch", content=REFUND_54,
                     headers={**REAL_HEADERS, "x-webhook-signature-512": REFUND_54_SIGNATURE})
-    # Already delivered to production during the replay, so this is the dedupe path.
-    status = r.json()["status"]
-    assert r.status_code == 200 and (status == "duplicate" or status.startswith("synced refund"))
+    # The real headers and signature are accepted. The refund belongs to production, not to
+    # this (dev) database, so the deliberate answer is "unknown_object", never an error.
+    event_ids.append("evt_01a12d22c2287d72a9a3927486d1e264")
+    assert r.status_code == 200 and r.json()["status"] == "unknown_object"

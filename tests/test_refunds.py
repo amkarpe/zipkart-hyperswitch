@@ -258,14 +258,42 @@ def test_customer_never_sees_error_codes(db, fake_hs):
     assert "IR_12" not in text and "maximum refund attempts" not in text
 
 
-def test_migration_moved_exactly_the_ir12_remedies(db):
-    moved = [r["id"] for r in db.sql(
-        "SELECT id FROM remedies WHERE manual_reason = 'refund attempt limit reached before settlement' ORDER BY id")]
-    assert moved == [8, 10, 12, 13, 14, 15, 16, 17, 19]
-    assert db.sql("SELECT count(*) AS n FROM remedies WHERE resolution = 'refund' "
-                  "AND status IN ('approved', 'failed')")[0]["n"] == 0
-    # history untouched: every attempt of those remedies is still there
-    assert db.sql("SELECT count(*) AS n FROM refunds WHERE remedy_id = ANY(%s)", moved)[0]["n"] == 75
+def test_migration_008_moves_only_remedies_on_payments_with_ir12(db):
+    """Runs migration 008's UPDATE on synthetic rows. (On production, on 2026-10-11, it moved
+    exactly remedies 8, 10, 12, 13, 14, 15, 16, 17, 19; dev no longer holds those copies.)"""
+    from pathlib import Path
+    sql = Path("migrations/008_refund_settlement_gate.sql").read_text()
+    update = sql[sql.index("UPDATE remedies m"):]
+
+    def failed_remedy(oid, item, codes):
+        rid = db.sql("""INSERT INTO remedies (order_id, order_item_id, pricing_type, quantity, reason, resolution,
+                            amount_cents, status) VALUES (%s, %s, 'fixed', 1, 'missing', 'refund', 429, 'failed')
+                        RETURNING id""", oid, item)[0]["id"]
+        for n, code in enumerate(codes, 1):
+            db.sql("""INSERT INTO refunds (refund_id, remedy_id, payment_id, attempt_no, amount_cents, status, error_code)
+                      VALUES (%s, %s, %s, %s, 429, 'failed', %s)""",
+                   f"rf_{oid}_{item}_missing_r{rid}_a{n}", rid, f"pay_{oid}_1", n, code)
+        return rid
+
+    hit_oid, hit_item = db.order(captured_at=now() - timedelta(days=3))
+    hit_a = failed_remedy(hit_oid, hit_item, ["54", "54", "IR_12"])
+    hit_b = failed_remedy(hit_oid, hit_item, ["54"])               # same order as an IR_12: moves too
+    miss_oid, miss_item = db.order(captured_at=now() - timedelta(days=3))
+    miss = failed_remedy(miss_oid, miss_item, ["54", "54"])        # never hit IR_12: stays
+    replacement = db.sql("""INSERT INTO remedies (order_id, order_item_id, pricing_type, quantity, reason, resolution,
+                                amount_cents, status) VALUES (%s, %s, 'fixed', 1, 'damaged', 'replacement', 0,
+                                'replacement_scheduled') RETURNING id""", hit_oid, hit_item)[0]["id"]
+    history_before = db.sql("SELECT count(*) AS n FROM refunds WHERE payment_id IN (%s, %s)",
+                            f"pay_{hit_oid}_1", f"pay_{miss_oid}_1")[0]["n"]
+
+    db.sql(update)
+    statuses = {rid: db.remedy_row(rid)["status"] for rid in (hit_a, hit_b, miss, replacement)}
+    assert statuses == {hit_a: "needs_manual_refund", hit_b: "needs_manual_refund",
+                        miss: "failed", replacement: "replacement_scheduled"}
+    assert db.remedy_row(hit_a)["manual_reason"] == "refund attempt limit reached before settlement"
+    assert db.remedy_row(hit_a)["last_error_code"] == "IR_12"
+    assert db.sql("SELECT count(*) AS n FROM refunds WHERE payment_id IN (%s, %s)",
+                  f"pay_{hit_oid}_1", f"pay_{miss_oid}_1")[0]["n"] == history_before   # history untouched
 
 
 # ── POST /internal/sweep ────────────────────────────────────────────────────
@@ -297,3 +325,82 @@ def test_sweep_endpoint_disabled_without_configured_secret(app_client, monkeypat
     from app import main
     monkeypatch.setattr(main, "settings", dataclasses.replace(main.settings, internal_sweep_secret=""))
     assert app_client.post("/internal/sweep", headers={"x-sweep-secret": ""}).status_code == 404
+
+
+# ── Manual resolution: needs_manual_refund -> refunded_manually ─────────────
+@pytest.fixture
+def store(app_client):
+    from app.config import settings
+    assert app_client.post("/store/api/login", json={"password": settings.store_console_password}).status_code == 200
+    yield app_client
+    app_client.post("/store/api/logout")
+
+
+def _needs_manual(db, fake_hs):
+    from app import refunds
+    fake_hs.respond = lambda p: hs.HyperswitchError(400, "IR_12", "Reached maximum refund attempts")
+    oid, item = db.order(captured_at=now() - timedelta(days=3))
+    rid = db.remedy(oid, item)
+    db.call(refunds.start_refund, rid)
+    assert db.remedy_row(rid)["status"] == "needs_manual_refund"
+    return oid, rid
+
+
+def test_mark_refunded_manually_records_and_is_final(db, fake_hs, store):
+    oid, rid = _needs_manual(db, fake_hs)
+    url = f"/store/api/orders/{oid}/remedies/{rid}/mark-refunded"
+    r = store.post(url, json={"processor_transaction_id": "120091999999", "note": "Refunded in Authorize.net by J."})
+    assert r.status_code == 200, r.text
+    row = db.remedy_row(rid)
+    assert row["status"] == "refunded_manually"
+    assert row["manual_refund_txn_id"] == "120091999999" and row["manual_refund_note"].startswith("Refunded in")
+    assert row["manual_refunded_at"] is not None
+    # final: a second click does nothing
+    again = store.post(url, json={"processor_transaction_id": "x", "note": "y"})
+    assert again.status_code == 409 and db.remedy_row(rid)["manual_refund_txn_id"] == "120091999999"
+    # the customer now sees it as sent, without any internal detail
+    view = store.get(f"/api/orders/{oid}").json()
+    msg = next(x["message"] for x in view["remedies"] if x["id"] == rid)
+    assert msg.startswith("Refund of $4.29 has been sent to your bank.")
+    assert "120091999999" not in str(view["remedies"]) and "IR_12" not in str(view["remedies"])
+
+
+def test_mark_refunded_manually_requires_both_fields(db, fake_hs, store):
+    oid, rid = _needs_manual(db, fake_hs)
+    url = f"/store/api/orders/{oid}/remedies/{rid}/mark-refunded"
+    assert store.post(url, json={"processor_transaction_id": "", "note": "n"}).status_code == 422
+    assert store.post(url, json={"processor_transaction_id": "t", "note": ""}).status_code == 422
+    assert store.post(url, json={"note": "n"}).status_code == 422
+    assert store.post(url, json={"processor_transaction_id": "   ", "note": "n"}).status_code == 400   # blank after trim
+    assert db.remedy_row(rid)["status"] == "needs_manual_refund"
+
+
+def test_mark_refunded_manually_only_from_needs_manual(db, fake_hs, store):
+    oid, item = db.order(captured_at=now())          # scheduled, not due: awaiting_settlement
+    rid = db.remedy(oid, item)
+    r = store.post(f"/store/api/orders/{oid}/remedies/{rid}/mark-refunded",
+                   json={"processor_transaction_id": "t", "note": "n"})
+    assert r.status_code == 409 and db.remedy_row(rid)["status"] == "awaiting_settlement"
+
+
+def test_mark_refunded_manually_needs_store_login(db, fake_hs, app_client):
+    oid, rid = _needs_manual(db, fake_hs)
+    app_client.post("/store/api/logout")
+    r = app_client.post(f"/store/api/orders/{oid}/remedies/{rid}/mark-refunded",
+                        json={"processor_transaction_id": "t", "note": "n"})
+    assert r.status_code == 401 and db.remedy_row(rid)["status"] == "needs_manual_refund"
+
+
+def test_database_rejects_incomplete_manual_refund(db, fake_hs):
+    import psycopg
+    oid, rid = _needs_manual(db, fake_hs)
+    with pytest.raises(psycopg.errors.CheckViolation):
+        db.sql("UPDATE remedies SET status = 'refunded_manually' WHERE id = %s", rid)
+
+
+def test_refund_copy_has_statement_timing():
+    from app.views import REMEDY_MESSAGES, STATEMENT_NOTE
+    assert STATEMENT_NOTE == "After it's sent, it usually appears on your statement within 5–10 business days."
+    for status, text in REMEDY_MESSAGES.items():
+        if status != "replacement_scheduled":
+            assert text.endswith(STATEMENT_NOTE), status

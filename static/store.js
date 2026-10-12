@@ -212,7 +212,8 @@ function subPickerPanel() {
 
 const REMEDY_STATUS = {
   awaiting_settlement: ["Scheduled", "warn"], refund_pending: ["Sent", "warn"], refunded: ["Refunded", ""],
-  needs_manual_refund: ["Needs manual refund", "bad"], replacement_scheduled: ["Replacement", ""],
+  needs_manual_refund: ["Needs manual refund", "bad"], refunded_manually: ["Refunded manually", ""],
+  replacement_scheduled: ["Replacement", ""],
   approved: ["Approved (legacy)", "warn"], failed: ["Failed (legacy)", "bad"],
 };
 
@@ -228,9 +229,15 @@ function remediesPanel(v) {
     const details = el("div", {});
     if (r.status === "awaiting_settlement" && r.next_attempt)
       details.append(el("div", {}, `Next attempt: ${r.next_attempt}`), el("div", { class: "muted" }, "Waits for the capture's batch to settle."));
-    if (r.status === "needs_manual_refund")
+    if (r.status === "needs_manual_refund") {
       details.append(el("div", { class: "error", style: "margin:0" },
-        el("strong", {}, "Refund this manually"), ` in the Hyperswitch or Authorize.net dashboard: ${r.manual_reason}`));
+        el("strong", {}, "Refund this manually"), ` in the Authorize.net dashboard: ${r.manual_reason}`));
+      details.append(manualRefundForm(r));
+    }
+    if (r.status === "refunded_manually")
+      details.append(el("div", {}, `Refunded manually ${r.manual_refunded_at}`),
+        el("div", { class: "muted" }, `Processor transaction ID: ${r.manual_refund_txn_id}`),
+        el("div", { class: "muted" }, `Note: ${r.manual_refund_note}`));
     if (r.last_error) details.append(el("div", { class: "muted" }, `Last processor response: ${r.last_error}`));
     if (r.note) details.append(el("div", { class: "muted" }, `Customer note: “${r.note}”`));
     table.append(el("tr", {},
@@ -241,6 +248,19 @@ function remediesPanel(v) {
   }
   panel.append(table, el("p", { class: "muted" }, `Times shown in store time (${v.store_timezone}).`));
   return panel;
+}
+
+function manualRefundForm(r) {
+  const txn = el("input", { type: "text", maxlength: "100", placeholder: "Processor transaction ID", "aria-label": "Processor transaction ID" });
+  const note = el("input", { type: "text", maxlength: "500", placeholder: "Note (who, how)", "aria-label": "Note" });
+  const btn = el("button", { onclick: () => {
+    if (!txn.value.trim() || !note.value.trim()) { alert("Transaction ID and note are both required."); return; }
+    if (!confirm(`Record ${money(r.amount_cents)} as refunded manually? This is final.`)) return;
+    subPicker = null;
+    act(api(`/remedies/${r.id}/mark-refunded`, { processor_transaction_id: txn.value.trim(), note: note.value.trim() }),
+        "Recorded as refunded manually.");
+  } }, "Mark refunded manually");
+  return el("div", { class: "inline", style: "margin-top:6px" }, txn, note, btn);
 }
 
 function kpi(label, value) {

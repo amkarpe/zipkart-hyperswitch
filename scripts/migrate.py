@@ -1,6 +1,8 @@
 """Apply migrations/*.sql in filename order, each exactly once.
 
 Usage:  python -m scripts.migrate      (Render runs this before starting the app)
+Locally it refuses to touch the production database (app/dbguard.py): production is
+migrated only by a deploy.
 
 Each file runs in its own transaction together with its schema_migrations row, so a
 file is either fully applied and recorded, or not applied at all. The transaction
@@ -13,12 +15,14 @@ from pathlib import Path
 import psycopg
 
 from app.config import settings
+from app.dbguard import assert_not_production
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 LOCK_KEY = 0x5A4B_4D49   # "ZKMI": any constant shared by every instance
 
 
 def main() -> None:
+    assert_not_production(settings.database_url, "migrations")
     with psycopg.connect(settings.database_url, prepare_threshold=None) as conn:
         with conn.transaction():
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (LOCK_KEY,))

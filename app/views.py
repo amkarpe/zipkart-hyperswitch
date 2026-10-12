@@ -153,15 +153,17 @@ def _usd(cents: int) -> str:
 
 
 # Customer-facing only: plain language, never an error code or processor message.
+STATEMENT_NOTE = "After it's sent, it usually appears on your statement within 5–10 business days."
 REMEDY_MESSAGES = {
-    "awaiting_settlement": "Refund of {amt} approved. It will be sent after your payment settles, by {by}.",
-    "refund_pending": "Refund of {amt} has been sent to your bank.",
-    "refunded": "Refunded {amt}. It can take a few days to appear, depending on your bank.",
-    "needs_manual_refund": "Our team is processing your refund of {amt}.",
+    "awaiting_settlement": "Refund of {amt} approved. It will be sent after your payment settles, by {by}. " + STATEMENT_NOTE,
+    "refund_pending": "Refund of {amt} has been sent to your bank. " + STATEMENT_NOTE,
+    "refunded": "Refund of {amt} has been sent to your bank. " + STATEMENT_NOTE,
+    "refunded_manually": "Refund of {amt} has been sent to your bank. " + STATEMENT_NOTE,
+    "needs_manual_refund": "Our team is processing your refund of {amt}. " + STATEMENT_NOTE,
     "replacement_scheduled": "A free replacement will be added to your next order.",
     # legacy states (no new rows use them)
-    "approved": "Refund of {amt} approved.",
-    "failed": "Our team is processing your refund of {amt}.",
+    "approved": "Refund of {amt} approved. " + STATEMENT_NOTE,
+    "failed": "Our team is processing your refund of {amt}. " + STATEMENT_NOTE,
 }
 
 

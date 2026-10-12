@@ -67,9 +67,12 @@ def _check_base_url() -> None:
 async def lifespan(_app: FastAPI):
     _check_base_url()
     await open_pool()
-    sweeper = asyncio.create_task(sweep.sweep_forever())
+    sweeper = asyncio.create_task(sweep.sweep_forever()) if settings.sweep_timer_enabled else None
+    log.info("background sweep timer: %s", "on" if sweeper else
+             "off (set SWEEP_TIMER_ENABLED=true to enable; Run now and POST /internal/sweep still work)")
     yield
-    sweeper.cancel()
+    if sweeper:
+        sweeper.cancel()
     await hs.close()
     await close_pool()
 
@@ -179,9 +182,16 @@ async def health():
         async with pool.connection() as conn:
             cur = await conn.execute("SELECT count(*) AS n FROM schema_migrations")
             migrations = (await cur.fetchone())["n"]
+            cur = await conn.execute(
+                "SELECT filename, applied_at FROM schema_migrations ORDER BY filename DESC LIMIT 1")
+            latest = await cur.fetchone()
     except Exception as exc:  # report, don't crash: Render uses this for health checks
         return JSONResponse({"status": "error", "database": repr(exc)}, status_code=503)
-    return {"status": "ok", "database": "ok", "migrations_applied": migrations}
+    # RENDER_GIT_COMMIT is set by Render: lets anyone confirm which commit is live.
+    return {"status": "ok", "database": "ok", "migrations_applied": migrations,
+            "latest_migration": latest and {"filename": latest["filename"],
+                                            "applied_at": latest["applied_at"].isoformat()},
+            "commit": (os.environ.get("RENDER_GIT_COMMIT") or "local")[:7]}
 
 
 @app.get("/api/products")

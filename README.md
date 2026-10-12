@@ -52,7 +52,42 @@ cp .env.example .env        # then fill it in (see below)
 
 Open http://localhost:8000 (shop) and http://localhost:8000/store (store console).
 
-Tests (the HTTP ones need `DATABASE_URL`; they clean up after themselves and make no Hyperswitch calls):
+### Never point local tools at production
+
+Use a **Neon branch** (e.g. `dev`, created from `production` with *Current data* and with
+automatic deletion turned off) for everything local. Put its **pooled** connection string in
+`DATABASE_URL`, and the production host in `PROD_DB_HOST`:
+
+```
+DATABASE_URL=postgresql://…@ep-<dev-endpoint>-pooler.<region>.aws.neon.tech/neondb?sslmode=require
+PROD_DB_HOST=ep-<prod-endpoint>-pooler.<region>.aws.neon.tech
+```
+
+`scripts/migrate.py`, `scripts/reset_dev_data.py` and the test suite refuse to run when
+`DATABASE_URL` points at `PROD_DB_HOST` (pooled or direct), and refuse locally if `PROD_DB_HOST`
+isn't set. On Render (`RENDER=true`) migrations run at start: **production is migrated only by a
+deploy.**
+
+**Dev must not hold copies of live payment state.** A branch created from production starts with
+production's orders, which carry real Hyperswitch payment and refund IDs. Anything on dev that acts
+on them (a sweep syncing or voiding a payment, a refund retry, a cancel) would act on the same
+sandbox payments production manages: two systems on one payment, each with its own refund attempt
+count against Hyperswitch's limit of 11. So, after creating the branch, run once:
+
+```bash
+.venv/bin/python -m scripts.reset_dev_data
+```
+
+It deletes orders and everything hanging off them (items, payments, remedies, refunds) plus the
+copied webhook events and failures, resets the sweep lease, and keeps products and
+`schema_migrations`. It shows the target endpoint and row counts and asks you to type the endpoint
+id before deleting.
+
+Automatic sweeps (the background timer and the sweep on store-console load) also act on payments,
+so they're **off locally**: `SWEEP_TIMER_ENABLED` decides when set, and when unset they run only on
+Render. *Run now* in the store console and `POST /internal/sweep` still work for deliberate testing.
+
+Tests (they clean up after themselves and make no Hyperswitch calls):
 
 ```bash
 .venv/bin/pip install -r requirements-dev.txt
@@ -109,7 +144,9 @@ Open **two windows side by side**: the customer on the left, the store console o
    (*"Refund of $X approved. It will be sent after your payment settles, by Oct 12."*), and the
    sweep sends it when it's due. The store console shows each refund's status, next attempt (store
    time) and attempts used out of 4; anything automation can't finish is marked **needs manual
-   refund** with the reason.
+   refund** with the reason. After refunding it in the Authorize.net dashboard, the shopper
+   records it with **Mark refunded manually** (processor transaction ID and a note required),
+   and the customer sees the refund as sent.
 
 ### Test cards (Authorize.net sandbox)
 
@@ -133,6 +170,9 @@ velocity filter.
 - **Start:** `python -m scripts.migrate && uvicorn app.main:app --host 0.0.0.0 --port $PORT …`
   (migrations run on every start; they're idempotent and lock-protected)
 - **Health check:** `/health` (runs a real query against the database)
+
+**Deploys:** every push to `main` deploys automatically (Auto-Deploy: On Commit). After a push,
+wait until `/health` reports the new commit (`RENDER_GIT_COMMIT`) before treating it as live.
 
 After the first deploy:
 1. Copy the service URL from the Render dashboard **exactly** (Render may add a suffix such as
@@ -167,8 +207,13 @@ loads, and Hyperswitch retries webhooks that arrive while the app is asleep.
   Refunds are scheduled for the settlement window, retried only once per window on error 54, and
   capped at 4 automatic attempts per payment, because Hyperswitch refuses any refund (`IR_12`) once a
   payment has 11 on record, failed ones included. Everything else goes to *needs manual refund*.
-- **The sweep needs traffic to run.** Render's free tier sleeps after 15 minutes without inbound
-  HTTP, and a sleeping app runs no timer. `POST /internal/sweep` lets an external scheduler wake it.
+- **The sweep runs hourly through GitHub Actions** (`.github/workflows/sweep.yml`, minute 17).
+  Render's free tier sleeps after 15 minutes without inbound HTTP, a sleeping app runs no timer, and
+  Hyperswitch webhooks don't reliably reach it, so an external schedule calls `POST /internal/sweep`
+  (header `X-Sweep-Secret`, from the `INTERNAL_SWEEP_SECRET` repository secret). Hourly keeps it
+  within the free Actions minutes for a private repo. Scheduled refunds therefore go out within
+  about an hour of their settlement window. **The first page load after the app has slept can take
+  about a minute** while Render starts it.
 - **Free replacements are recorded, not fulfilled.** There's no "next order" credit system yet.
 - **No customer accounts.** Anyone with an order's link (a random 12-character ID) can view it and
   report problems on it.
