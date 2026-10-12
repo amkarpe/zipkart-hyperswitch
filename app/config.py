@@ -32,6 +32,10 @@ class Settings:
     sweep_interval_seconds: int
     settlement_cutoff: str        # "HH:MM", Authorize.net Transaction Cut-Off Time
     settlement_timezone: str
+    settlement_margin_hours: float
+    refund_max_auto_attempts_per_payment: int
+    store_timezone: str
+    internal_sweep_secret: str    # empty = POST /internal/sweep disabled
 
 
 def load_settings() -> Settings:
@@ -50,9 +54,15 @@ def load_settings() -> Settings:
         substitution_timeout_seconds=int(os.environ.get("SUBSTITUTION_TIMEOUT_SECONDS", "60")),
         reconcile_after_minutes=int(os.environ.get("RECONCILE_AFTER_MINUTES", "5")),
         sweep_interval_seconds=int(os.environ.get("SWEEP_INTERVAL_SECONDS", "180")),
-        # Authorize.net's default cut-off is 3:00 PM Pacific (Account > Settings > Transaction Cut-Off Time).
-        settlement_cutoff=os.environ.get("SETTLEMENT_CUTOFF", "15:00").strip(),
+        # Authorize.net Transaction Cut-Off Time for this account (Account > Settings): 4:00 PM Pacific.
+        settlement_cutoff=os.environ.get("SETTLEMENT_CUTOFF", "16:00").strip(),
         settlement_timezone=os.environ.get("SETTLEMENT_TIMEZONE", "America/Los_Angeles").strip(),
+        # Batches settle some time after the cut-off (observed: 20:45 PDT for a 16:00 cut-off).
+        settlement_margin_hours=float(os.environ.get("SETTLEMENT_MARGIN_HOURS", "6")),
+        # Hyperswitch allows 11 refunds per payment (failed ones included); stay well below.
+        refund_max_auto_attempts_per_payment=int(os.environ.get("REFUND_MAX_AUTO_ATTEMPTS_PER_PAYMENT", "4")),
+        store_timezone=os.environ.get("STORE_TIMEZONE", "America/Chicago").strip(),
+        internal_sweep_secret=os.environ.get("INTERNAL_SWEEP_SECRET", "").strip(),
     )
 
 

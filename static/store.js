@@ -210,6 +210,39 @@ function subPickerPanel() {
   return panel;
 }
 
+const REMEDY_STATUS = {
+  awaiting_settlement: ["Scheduled", "warn"], refund_pending: ["Sent", "warn"], refunded: ["Refunded", ""],
+  needs_manual_refund: ["Needs manual refund", "bad"], replacement_scheduled: ["Replacement", ""],
+  approved: ["Approved (legacy)", "warn"], failed: ["Failed (legacy)", "bad"],
+};
+
+function remediesPanel(v) {
+  const used = v.refund_attempts_used, cap = v.refund_attempts_cap;
+  const panel = el("div", { class: "panel" },
+    el("div", { class: "row" }, el("h2", {}, "Problems & refunds"),
+      el("span", { class: `pill ${used >= cap ? "bad" : ""}` }, `${used} of ${cap} automatic refund attempts used on this payment`)));
+  const table = el("table", { class: "lines" },
+    el("tr", {}, el("th", {}, "Item"), el("th", {}, "Resolution"), el("th", {}, "Status"), el("th", {}, "Details")));
+  for (const r of v.remedies) {
+    const [label, cls] = REMEDY_STATUS[r.status] || [r.status, ""];
+    const details = el("div", {});
+    if (r.status === "awaiting_settlement" && r.next_attempt)
+      details.append(el("div", {}, `Next attempt: ${r.next_attempt}`), el("div", { class: "muted" }, "Waits for the capture's batch to settle."));
+    if (r.status === "needs_manual_refund")
+      details.append(el("div", { class: "error", style: "margin:0" },
+        el("strong", {}, "Refund this manually"), ` in the Hyperswitch or Authorize.net dashboard: ${r.manual_reason}`));
+    if (r.last_error) details.append(el("div", { class: "muted" }, `Last processor response: ${r.last_error}`));
+    if (r.note) details.append(el("div", { class: "muted" }, `Customer note: “${r.note}”`));
+    table.append(el("tr", {},
+      el("td", {}, `${r.item_name}${r.quantity ? ` × ${r.quantity}` : ""}`, el("br"), el("span", { class: "muted" }, r.reason)),
+      el("td", {}, r.resolution === "refund" ? `Refund ${money(r.amount_cents)}` : "Free replacement"),
+      el("td", {}, el("span", { class: `pill ${cls}` }, label)),
+      el("td", {}, details)));
+  }
+  panel.append(table, el("p", { class: "muted" }, `Times shown in store time (${v.store_timezone}).`));
+  return panel;
+}
+
 function kpi(label, value) {
   return el("div", { class: "kpi" }, el("div", { class: "v" }, value), el("div", { class: "l" }, label));
 }
@@ -265,6 +298,7 @@ function render(v, message = "") {
     }
   }
   box.append(el("div", { class: "panel" }, table));
+  if (v.remedies.length) box.append(remediesPanel(v));
 
   const actions = el("div", { class: "panel" });
   const msg = el("div", { id: "order-msg", class: message ? "muted" : "" }, message);

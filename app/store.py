@@ -22,7 +22,9 @@ from app import fulfillment as ff
 from app import sweep
 from app.config import settings
 from app.db import pool
-from app.views import _item_view, _seconds_left, hold_breakdown, load_order
+from app.refunds import attempts_used
+from app.settlement import store_time
+from app.views import _item_view, _seconds_left, hold_breakdown, load_order, load_remedies
 
 COOKIE = "zk_store"
 SESSION_SECONDS = 12 * 3600
@@ -118,8 +120,10 @@ async def store_view(order_id: str) -> dict:
     await ff.apply_expired_substitutions(order_id)
     async with pool.connection() as conn:
         order, items, payment = await load_order(conn, order_id)
-    if order is None:
-        raise HTTPException(status_code=404, detail="Order not found.")
+        if order is None:
+            raise HTTPException(status_code=404, detail="Order not found.")
+        remedies = await load_remedies(conn, order_id)
+        used = await attempts_used(conn, order_id)
     committed = ff.committed_totals(order, items)
     capturable = payment["amount_capturable_cents"] if payment and payment["status"] == "requires_capture" else None
     lines = []
@@ -158,6 +162,17 @@ async def store_view(order_id: str) -> dict:
         "substitution_timeout_seconds": settings.substitution_timeout_seconds,
         "weight_tolerance_percent": ff.WEIGHT_TOLERANCE_PERCENT,
         "items": lines,
+        "refund_attempts_used": used,
+        "refund_attempts_cap": settings.refund_max_auto_attempts_per_payment,
+        "store_timezone": settings.store_timezone,
+        "remedies": [{
+            "id": r["id"], "item_name": r["item_name"], "quantity": r["quantity"], "reason": r["reason"],
+            "resolution": r["resolution"], "amount_cents": r["amount_cents"], "status": r["status"],
+            "note": r["note"],
+            "next_attempt": store_time(r["next_attempt_at"]) if r["next_attempt_at"] else None,
+            "manual_reason": r["manual_reason"],
+            "last_error": (f"{r['last_error_code']}: {r['last_error_message']}" if r["last_error_code"] else None),
+        } for r in remedies],
         "server_time": datetime.now(timezone.utc).isoformat(),
     }
 

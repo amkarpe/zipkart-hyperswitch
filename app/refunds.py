@@ -1,24 +1,41 @@
 """Refund attempts for remedies.
 
-refund_id = rf_{order}_{item}_{reason}_r{remedy}_a{n}
-  * deterministic, so re-sending after a timeout is safe: Hyperswitch answers HE_01
-    and we fetch instead;
-  * includes the remedy id because one line can have several remedies (two cartons
-    missing, reported at different times). Without it both would share a refund_id
-    and the second would be swallowed as an "HE_01 duplicate" and never paid;
-  * the attempt number moves to n+1 only after the previous attempt is CONFIRMED
-    failed (Hyperswitch keeps the failed refund under its id, so reusing the id would
-    hit HE_01 forever).
+State machine (refund remedies):
 
-Authorize.net only refunds settled transactions. Before the nightly settlement,
-Hyperswitch returns status=failed with error_code "54" (verified in sandbox). That's
-not a real failure: the remedy waits in awaiting_settlement and the sweep retries
-after the next settlement cutoff.
+    (report) ──▶ awaiting_settlement   next_attempt_at = gate(captured_at). Nothing is sent.
+    awaiting_settlement ──(sweep: due, payment attempts < cap)──▶ refund_pending   attempt row a{n} inserted, then POST
+    awaiting_settlement ──(sweep: due, payment attempts ≥ cap)──▶ needs_manual_refund
+    refund_pending ──succeeded──▶ refunded
+    refund_pending ──pending/review──▶ refund_pending                       (sweep GETs it; a GET is not an attempt)
+    refund_pending ──failed, error 54──▶ awaiting_settlement               next_attempt_at = gate(now): next window
+    refund_pending ──failed, any other code──▶ needs_manual_refund
+    refund_pending ──request rejected (IR_12, any other 4xx)──▶ needs_manual_refund
+    refund_pending ──timeout/5xx──▶ refund_pending                          (sweep GETs; HE_02 = never received:
+                                                                            re-send the SAME refund_id, same attempt)
+    refunded, needs_manual_refund: final for automation.
+
+refund_id = rf_{order}_{item}_{reason}_r{remedy}_a{n}
+  * deterministic, so re-sending after a timeout is safe (HE_01 -> fetch instead);
+  * includes the remedy id: one line can have several remedies with the same reason;
+  * attempt n+1 only after attempt n is confirmed failed (Hyperswitch keeps failed
+    refunds under their id).
+
+Budget: Hyperswitch rejects a refund with IR_12 once the payment already has more than
+[refund] max_attempts = 10 refunds on record, failed ones included (verified in its
+source). We count every attempt we've made on the payment, across all its remedies,
+under the order-row lock, and stop automatically at REFUND_MAX_AUTO_ATTEMPTS_PER_PAYMENT.
+
+Error 54 = "does not meet the criteria for issuing a credit": usually "not settled
+yet", but Authorize.net also uses it for invalid type, wrong currency, bad reference
+or >180 days. So it's treated as "next window", and the per-payment cap is the backstop.
 """
 import logging
+from datetime import datetime, timezone
 
 from app import hyperswitch as hs
+from app.config import settings
 from app.db import pool
+from app.settlement import refund_gate
 
 log = logging.getLogger("zipkart.refunds")
 
@@ -37,23 +54,57 @@ def refund_id_for(order_id: str, item_id: int, reason: str, remedy_id: int, atte
     return f"rf_{order_id}_{item_id}_{reason}_r{remedy_id}_a{attempt_no}"
 
 
-async def start_refund(remedy_id: int) -> str | None:
-    """Open the next refund attempt for a remedy and send it. Returns the refund_id,
-    or None if there's nothing to do (already in flight, refunded, or not a refund)."""
+def remedy_outcome(refund_status: str, error_code: str | None) -> str | None:
+    """Where a remedy goes when its latest attempt reaches refund_status. None = stays put."""
+    if refund_status == "succeeded":
+        return "refunded"
+    if refund_status == "failed":
+        return "awaiting_settlement" if error_code == NOT_SETTLED_CODE else "needs_manual_refund"
+    return None   # pending / review: still in flight
+
+
+async def _move_remedy(conn, remedy_id: int, new: str, code: str | None, message: str | None) -> bool:
+    """refund_pending -> new, with the scheduling / manual fields that state needs (CAS)."""
+    now = datetime.now(timezone.utc)
+    cur = await conn.execute(
+        """UPDATE remedies SET status = %s,
+               next_attempt_at = %s,
+               manual_reason = %s,
+               last_error_code = COALESCE(%s, last_error_code),
+               last_error_message = COALESCE(%s, last_error_message),
+               updated_at = now()
+           WHERE id = %s AND status = 'refund_pending'""",
+        (new,
+         refund_gate(now) if new == "awaiting_settlement" else None,
+         f"refund failed: {code or 'unknown error'}" if new == "needs_manual_refund" else None,
+         code, message, remedy_id),
+    )
+    if cur.rowcount and new == "needs_manual_refund":
+        log.error("remedy %s needs a manual refund: %s %s", remedy_id, code, message)
+    return bool(cur.rowcount)
+
+
+async def start_refund(remedy_id: int, now: datetime | None = None) -> str | None:
+    """Send the next attempt for a DUE remedy. Returns the refund_id, or None when nothing
+    was sent (not due, not waiting, an attempt in flight, or the budget is used up)."""
+    now = now or datetime.now(timezone.utc)
+    cap = settings.refund_max_auto_attempts_per_payment
     async with pool.connection() as conn, conn.transaction():
         cur = await conn.execute("SELECT order_id FROM remedies WHERE id = %s", (remedy_id,))
         row = await cur.fetchone()
         if row is None:
             raise RefundError("Remedy not found.", 404)
-        # Lock the order: the refund cap below sums across all of its refunds.
+        # One lock per order (= per captured payment): every check below and the attempt
+        # insert happen under it, so two overlapping sweeps can't both take the last attempt.
         cur = await conn.execute(
             "SELECT id, captured_amount_cents FROM orders WHERE id = %s FOR UPDATE", (row["order_id"],)
         )
         order = await cur.fetchone()
         cur = await conn.execute("SELECT * FROM remedies WHERE id = %s", (remedy_id,))
         remedy = await cur.fetchone()
-        if remedy["resolution"] != "refund" or remedy["status"] not in ("approved", "awaiting_settlement"):
-            return None
+        if (remedy["resolution"] != "refund" or remedy["status"] != "awaiting_settlement"
+                or remedy["next_attempt_at"] is None or remedy["next_attempt_at"] > now):
+            return None   # not scheduled, or not due yet: never sent before its window
         cur = await conn.execute(
             "SELECT * FROM refunds WHERE remedy_id = %s ORDER BY attempt_no DESC LIMIT 1", (remedy_id,)
         )
@@ -67,15 +118,26 @@ async def start_refund(remedy_id: int) -> str | None:
         payment = await cur.fetchone()
         if payment is None:
             raise RefundError("This order has no captured payment to refund.")
+
         cur = await conn.execute(
-            "SELECT COALESCE(SUM(amount_cents), 0) AS total FROM refunds "
-            "WHERE payment_id = %s AND status IN ('pending', 'succeeded')",
+            """SELECT count(*) AS attempts,
+                      COALESCE(SUM(amount_cents) FILTER (WHERE status IN ('pending', 'succeeded')), 0) AS live_total
+               FROM refunds WHERE payment_id = %s""",
             (payment["payment_id"],),
         )
-        live_total = (await cur.fetchone())["total"]
-        if live_total + remedy["amount_cents"] > (order["captured_amount_cents"] or 0):
-            await conn.execute("UPDATE remedies SET status = 'failed', updated_at = now() WHERE id = %s", (remedy_id,))
-            log.error("remedy %s: refund would exceed captured amount", remedy_id)
+        used = await cur.fetchone()
+        reason = None
+        if used["attempts"] >= cap:
+            reason = f"automatic refund attempt limit ({cap}) reached for this payment"
+        elif used["live_total"] + remedy["amount_cents"] > (order["captured_amount_cents"] or 0):
+            reason = "refund would exceed the captured amount"
+        if reason:
+            await conn.execute(
+                "UPDATE remedies SET status = 'needs_manual_refund', manual_reason = %s, next_attempt_at = NULL, "
+                "updated_at = now() WHERE id = %s AND status = 'awaiting_settlement'",
+                (reason, remedy_id),
+            )
+            log.error("remedy %s needs a manual refund: %s", remedy_id, reason)
             return None
 
         attempt_no = 1 if previous is None else previous["attempt_no"] + 1
@@ -86,8 +148,8 @@ async def start_refund(remedy_id: int) -> str | None:
             (refund_id, remedy_id, payment["payment_id"], attempt_no, remedy["amount_cents"]),
         )
         await conn.execute(
-            "UPDATE remedies SET status = 'refund_pending', updated_at = now() "
-            "WHERE id = %s AND status IN ('approved', 'awaiting_settlement')",
+            "UPDATE remedies SET status = 'refund_pending', next_attempt_at = NULL, updated_at = now() "
+            "WHERE id = %s AND status = 'awaiting_settlement'",
             (remedy_id,),
         )
         payload = {
@@ -112,7 +174,8 @@ async def send_refund(payload: dict) -> None:
         if exc.code == "HE_01":   # already attempted with this id: fetch and record
             snap = await fetch_refund(refund_id)
         else:
-            # Hyperswitch rejected the request itself; nothing was sent to the processor.
+            # Hyperswitch rejected the request itself (e.g. IR_12): record it as failed
+            # with its code, which sends the remedy to needs_manual_refund.
             log.error("refund %s rejected: %s %s", refund_id, exc.code, exc.message)
             snap = {"refund_id": refund_id, "status": "failed", "error_code": exc.code, "error_message": exc.message}
     except hs.HyperswitchUnavailable as exc:
@@ -133,7 +196,8 @@ async def fetch_refund(refund_id: str) -> dict | None:
 
 
 async def record_refund(snap: dict) -> str | None:
-    """Apply a refund snapshot forward-only (pending -> succeeded|failed) and move its remedy."""
+    """Apply a refund snapshot forward-only (pending -> succeeded|failed) and move its remedy.
+    Used for send results, webhooks and GET polls alike; never creates an attempt."""
     raw = snap.get("status")
     status = {"succeeded": "succeeded", "failed": "failed", "pending": "pending", "review": "pending"}.get(raw)
     if status is None:
@@ -154,20 +218,9 @@ async def record_refund(snap: dict) -> str | None:
         if row is None:   # unknown refund or already final: never move a final refund back
             await conn.execute("UPDATE refunds SET last_synced_at = now() WHERE refund_id = %s", (snap["refund_id"],))
             return None
-        if status == "succeeded":
-            new_remedy = "refunded"
-        elif status == "failed" and snap.get("error_code") == NOT_SETTLED_CODE:
-            new_remedy = "awaiting_settlement"
-        elif status == "failed":
-            new_remedy = "failed"
-        else:
-            return status
-        await conn.execute(
-            "UPDATE remedies SET status = %s, updated_at = now() WHERE id = %s AND status = 'refund_pending'",
-            (new_remedy, row["remedy_id"]),
-        )
-        if new_remedy == "failed":
-            log.error("refund %s failed: %s %s", snap["refund_id"], snap.get("error_code"), snap.get("error_message"))
+        new = remedy_outcome(status, snap.get("error_code"))
+        if new is not None:
+            await _move_remedy(conn, row["remedy_id"], new, snap.get("error_code"), snap.get("error_message"))
     return status
 
 
@@ -176,24 +229,22 @@ async def repair_remedy(remedy_id: int) -> str | None:
     (e.g. the process died between recording the refund and moving the remedy)."""
     async with pool.connection() as conn, conn.transaction():
         cur = await conn.execute(
-            "SELECT status, error_code FROM refunds WHERE remedy_id = %s ORDER BY attempt_no DESC LIMIT 1",
+            "SELECT status, error_code, error_message FROM refunds WHERE remedy_id = %s "
+            "ORDER BY attempt_no DESC LIMIT 1",
             (remedy_id,),
         )
         last = await cur.fetchone()
-        if last is None or last["status"] == "pending":
+        new = None if last is None else remedy_outcome(last["status"], last["error_code"])
+        if new is None:
             return None
-        new = ("refunded" if last["status"] == "succeeded"
-               else "awaiting_settlement" if last["error_code"] == NOT_SETTLED_CODE else "failed")
-        cur = await conn.execute(
-            "UPDATE remedies SET status = %s, updated_at = now() WHERE id = %s AND status = 'refund_pending'",
-            (new, remedy_id),
-        )
-        return new if cur.rowcount else None
+        moved = await _move_remedy(conn, remedy_id, new, last["error_code"], last["error_message"])
+        return new if moved else None
 
 
 async def check_pending(refund_id: str) -> str:
-    """GET a pending attempt. If Hyperswitch never received it (HE_02), re-send the
-    SAME refund_id: safe, because if it did land meanwhile we get HE_01 and fetch."""
+    """GET a pending attempt (a GET is never a new attempt). If Hyperswitch never received
+    it (HE_02), re-send the SAME refund_id: same attempt row, and if it did land meanwhile
+    we get HE_01 and fetch."""
     try:
         snap = await hs.retrieve_refund(refund_id)
     except hs.HyperswitchError as exc:
@@ -214,3 +265,11 @@ async def check_pending(refund_id: str) -> str:
         })
         return "resent"
     return await record_refund(snap) or "unchanged"
+
+
+async def attempts_used(conn, order_id: str) -> int:
+    cur = await conn.execute(
+        "SELECT count(*) AS n FROM refunds f JOIN remedies m ON m.id = f.remedy_id WHERE m.order_id = %s",
+        (order_id,),
+    )
+    return (await cur.fetchone())["n"]

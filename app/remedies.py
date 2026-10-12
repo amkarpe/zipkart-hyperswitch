@@ -12,6 +12,7 @@ order row. Two concurrent remedy requests for the same order queue behind that
 lock, and the second one sees the first one's row when it re-checks.
 """
 from app.db import pool
+from app.settlement import refund_gate
 from app.pricing import tax_for
 
 REMEDIABLE_ORDER_STATUSES = ("captured", "delivered")
@@ -38,7 +39,7 @@ async def insert_remedy(conn, order_id: str, order_item_id: int, reason: str,
                         resolution: str, quantity: int | None, note: str | None = None) -> dict:
     """Validate and insert inside the caller's transaction (the caller commits)."""
     cur = await conn.execute(
-        "SELECT status, captured_amount_cents FROM orders WHERE id = %s FOR UPDATE", (order_id,)
+        "SELECT status, captured_amount_cents, captured_at FROM orders WHERE id = %s FOR UPDATE", (order_id,)
     )
     order = await cur.fetchone()
     if order is None:
@@ -86,6 +87,7 @@ async def insert_remedy(conn, order_id: str, order_item_id: int, reason: str,
     if resolution == "refund":
         cur = await conn.execute(
             "SELECT COALESCE(SUM(amount_cents), 0) AS total FROM remedies "
+            # needs_manual_refund still counts: that money is still owed to the customer.
             "WHERE order_id = %s AND resolution = 'refund' AND status <> 'failed'",
             (order_id,),
         )
@@ -95,11 +97,13 @@ async def insert_remedy(conn, order_id: str, order_item_id: int, reason: str,
 
     cur = await conn.execute(
         """INSERT INTO remedies (order_id, order_item_id, pricing_type, quantity, reason, resolution,
-               amount_cents, status, note)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+               amount_cents, status, note, next_attempt_at)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
            RETURNING *""",
         (order_id, order_item_id, item["pricing_type"], quantity, reason, resolution, amount,
-         "approved" if resolution == "refund" else "replacement_scheduled", note or None),
+         "awaiting_settlement" if resolution == "refund" else "replacement_scheduled", note or None,
+         # Scheduled, not sent: the first attempt waits for the capture's batch to settle.
+         refund_gate(order["captured_at"]) if resolution == "refund" else None),
     )
     return await cur.fetchone()
 

@@ -73,7 +73,10 @@ Tests (the HTTP ones need `DATABASE_URL`; they clean up after themselves and mak
 | `WEIGHT_BUFFER_PERCENT` | Extra hold on weighed items (default 15). |
 | `SUBSTITUTION_TIMEOUT_SECONDS` | How long a customer has to answer a substitution (default 60). |
 | `RECONCILE_AFTER_MINUTES` | How long a payment can sit in a non-final state before the sweep re-checks it. |
-| `SETTLEMENT_CUTOFF`, `SETTLEMENT_TIMEZONE` | Your Authorize.net Transaction Cut-Off Time (default 15:00 America/Los_Angeles). |
+| `SETTLEMENT_CUTOFF`, `SETTLEMENT_TIMEZONE`, `SETTLEMENT_MARGIN_HOURS` | Your Authorize.net Transaction Cut-Off Time (default 16:00 America/Los_Angeles) and how long after it a batch is safely settled (default 6 h). A refund is first sent at *first cut-off after the capture + margin*. |
+| `REFUND_MAX_AUTO_ATTEMPTS_PER_PAYMENT` | Automatic refund attempts per payment across all its remedies (default 4; Hyperswitch allows 11). |
+| `STORE_TIMEZONE` | Times shown in the store console and on customer pages (default America/Chicago). |
+| `INTERNAL_SWEEP_SECRET` | Shared secret for `POST /internal/sweep` (header `X-Sweep-Secret`), so an external scheduler can wake the app and run the sweep. Empty disables the endpoint. |
 | `SWEEP_INTERVAL_SECONDS` | Background reconciliation interval (default 180). |
 
 ## Demo walkthrough
@@ -101,9 +104,12 @@ Open **two windows side by side**: the customer on the left, the store console o
 6. **Customer: receipt.** "Picked and on its way" with what was held, charged and released, and
    every line that changed (actual weight vs estimate, substitutions, removals, lower quantities).
 7. **Customer: report a problem.** Below the receipt: missing (refund), damaged or expired (refund
-   or free replacement), with a quantity for fixed-price items. Before Authorize.net settles the
-   capture (nightly), the refund is approved and waits: *"Refund of $X approved. It will post once
-   your payment settles."* The sweep sends it after the next settlement cut-off.
+   or free replacement), with a quantity for fixed-price items. A refund is never sent before the
+   capture settles: it's scheduled for the first cut-off after the capture plus a margin
+   (*"Refund of $X approved. It will be sent after your payment settles, by Oct 12."*), and the
+   sweep sends it when it's due. The store console shows each refund's status, next attempt (store
+   time) and attempts used out of 4; anything automation can't finish is marked **needs manual
+   refund** with the reason.
 
 ### Test cards (Authorize.net sandbox)
 
@@ -157,8 +163,12 @@ loads, and Hyperswitch retries webhooks that arrive while the app is asleep.
 
 ## Known limitations
 
-- **Refunds wait for settlement.** Authorize.net only refunds settled captures (nightly batch); a
-  same-day report is approved immediately but paid after the next cut-off.
+- **Refunds wait for settlement.** Authorize.net only refunds settled captures (error 54 before that).
+  Refunds are scheduled for the settlement window, retried only once per window on error 54, and
+  capped at 4 automatic attempts per payment, because Hyperswitch refuses any refund (`IR_12`) once a
+  payment has 11 on record, failed ones included. Everything else goes to *needs manual refund*.
+- **The sweep needs traffic to run.** Render's free tier sleeps after 15 minutes without inbound
+  HTTP, and a sleeping app runs no timer. `POST /internal/sweep` lets an external scheduler wake it.
 - **Free replacements are recorded, not fulfilled.** There's no "next order" credit system yet.
 - **No customer accounts.** Anyone with an order's link (a random 12-character ID) can view it and
   report problems on it.

@@ -10,7 +10,7 @@ action whose intent is already committed. Nothing is retried blindly.
      closed the tab before the return page, with the webhook lost)
   b. finish orders stuck in 'cancelling'
   c. void inactive payment attempts that still hold funds
-  d. retry awaiting_settlement refunds for captures made before the last cut-off
+  d. send refunds whose settlement window has come (next_attempt_at <= now)
   e. check pending refunds (and repair remedies whose refund is already final)
 
 Only one sweep runs at a time: a lease row taken with compare-and-set. (A Postgres
@@ -23,7 +23,6 @@ import logging
 import os
 import socket
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 from app import fulfillment as ff
 from app import hyperswitch as hs
@@ -34,23 +33,10 @@ from app.db import pool
 log = logging.getLogger("zipkart.sweep")
 
 LEASE = timedelta(minutes=3)
-SETTLEMENT_MARGIN = timedelta(minutes=30)   # batch settles shortly after the cut-off
 BATCH = 50
 ABANDONED_BATCH = 20                        # unpaid checkouts fetched per run
 SESSION_GRACE = timedelta(minutes=5)        # after expiry, one more look and we stop
 _OWNER = f"{socket.gethostname()}:{os.getpid()}"
-
-
-def last_settlement_cutoff(now: datetime | None = None) -> datetime:
-    """The most recent cut-off whose batch has had time to settle. Captures made
-    before it are refundable now."""
-    tz = ZoneInfo(settings.settlement_timezone)
-    hour, minute = (int(x) for x in settings.settlement_cutoff.split(":"))
-    local = (now or datetime.now(timezone.utc)).astimezone(tz)
-    cutoff = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if local < cutoff + SETTLEMENT_MARGIN:
-        cutoff -= timedelta(days=1)
-    return cutoff
 
 
 async def _rows(sql: str, params: tuple = ()) -> list[dict]:
@@ -152,30 +138,21 @@ async def _void_inactive_holds() -> list[dict]:
 
 
 # d ──────────────────────────────────────────────────────────────────────────
-async def _retry_settled_refunds() -> list[dict]:
-    cutoff = last_settlement_cutoff()
+async def _send_due_refunds() -> list[dict]:
+    """The only place a refund is sent: remedies whose settlement window has come.
+    start_refund re-checks due-ness and the per-payment budget under the order lock."""
     rows = await _rows(
-        """SELECT r.id AS remedy_id, r.status,
-                  (SELECT f.refund_id FROM refunds f WHERE f.remedy_id = r.id ORDER BY f.attempt_no DESC LIMIT 1) AS last_refund
-           FROM remedies r JOIN orders o ON o.id = r.order_id
-           WHERE r.resolution = 'refund'
-             AND ((r.status = 'awaiting_settlement' AND o.captured_at < %s)
-               OR (r.status = 'approved' AND r.created_at < now() - interval '2 minutes'))  -- intent with no attempt
-           LIMIT %s""",
-        (cutoff, BATCH),
+        """SELECT id AS remedy_id FROM remedies
+           WHERE resolution = 'refund' AND status = 'awaiting_settlement' AND next_attempt_at <= now()
+           ORDER BY next_attempt_at LIMIT %s""",
+        (BATCH,),
     )
 
-    async def retry(row):
-        if row["last_refund"]:
-            # Attempt n+1 only after CONFIRMING attempt n failed at Hyperswitch.
-            snap = await hs.retrieve_refund(row["last_refund"])
-            await refunds.record_refund(snap)
-            if snap.get("status") != "failed":
-                return f"not retried: {row['last_refund']} is {snap.get('status')}"
-        new_id = await refunds.start_refund(row["remedy_id"])
+    async def send(row):
+        refund_id = await refunds.start_refund(row["remedy_id"])
         status = (await _rows("SELECT status FROM remedies WHERE id = %s", (row["remedy_id"],)))[0]["status"]
-        return f"{new_id} -> remedy {status}" if new_id else f"nothing to send (remedy {status})"
-    return await _each("refund retry", rows, retry)
+        return f"{refund_id} -> remedy {status}" if refund_id else f"not sent (remedy {status})"
+    return await _each("refund", rows, send)
 
 
 # e ──────────────────────────────────────────────────────────────────────────
@@ -212,7 +189,7 @@ async def run_sweep(trigger: str) -> dict | None:
         result["a_payments_synced"] = await _sync_stale_payments()
         result["b_cancelling_finished"] = await _finish_cancelling()
         result["c_stray_holds_voided"] = await _void_inactive_holds()
-        result["d_refunds_retried"] = await _retry_settled_refunds()
+        result["d_refunds_sent"] = await _send_due_refunds()
         result["e_refunds_checked"] = await _check_pending_refunds()
     finally:
         result["seconds"] = round((datetime.now(timezone.utc) - started).total_seconds(), 1)

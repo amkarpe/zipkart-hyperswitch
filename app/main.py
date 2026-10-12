@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import logging
 import os
 import re
@@ -7,7 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field, field_validator
@@ -15,7 +16,6 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 from app import fulfillment
 from app import hyperswitch as hs
 from app import payments
-from app import refunds
 from app import sweep
 from app.config import settings
 from app.db import close_pool, open_pool, pool
@@ -155,6 +155,24 @@ async def order_page(order_id: str):
 
 
 # ── API ────────────────────────────────────────────────────────────────────
+@app.post("/internal/sweep", include_in_schema=False)
+async def internal_sweep(request: Request):
+    """Lets an external scheduler wake the app and run the reconciliation sweep.
+    Render's free tier sleeps after 15 minutes without inbound HTTP, and a sleeping
+    instance runs no background timer, so scheduled refunds would never fire."""
+    expected = settings.internal_sweep_secret
+    if not expected:
+        return JSONResponse({"error": "not found"}, status_code=404)   # disabled until configured
+    received = request.headers.get("x-sweep-secret", "")
+    if not hmac.compare_digest(received.encode("utf-8", "replace"), expected.encode()):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    result = await sweep.run_sweep("internal")
+    if result is None:
+        return JSONResponse({"status": "already running"}, status_code=202)
+    return {"status": "ok", "seconds": result["seconds"],
+            "changes": {k: len(v) for k, v in result.items() if isinstance(v, list)}}
+
+
 @app.get("/health")
 async def health():
     try:
@@ -238,12 +256,10 @@ class ProblemReport(BaseModel):
 
 @app.post("/api/orders/{order_id}/remedies")
 async def report_problem(order_id: str, body: ProblemReport):
-    # Tx 1 (remedies.insert_remedy): validate limits under the order lock and record it.
-    remedy = await create_remedy(order_id, body.item_id, body.reason, body.resolution, body.quantity,
-                                 (body.note or "").strip() or None)
-    # Tx 2 + Hyperswitch call: open refund attempt 1 and send it.
-    if remedy["resolution"] == "refund":
-        await refunds.start_refund(remedy["id"])
+    # Validate limits under the order lock and record it. A refund is only SCHEDULED here
+    # (next_attempt_at = settlement gate); the sweep sends it once it's due.
+    await create_remedy(order_id, body.item_id, body.reason, body.resolution, body.quantity,
+                        (body.note or "").strip() or None)
     return await payments.order_view(order_id)
 
 

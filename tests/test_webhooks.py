@@ -89,16 +89,8 @@ def test_malformed_payloads_raise_malformed(body, reason):
 
 # ── Through the HTTP handler (needs the database) ───────────────────────────
 @pytest.fixture(scope="module")
-def client():
-    # Module-scoped: the app's connection pool can be opened once per process.
-    from fastapi.testclient import TestClient
-
+def client(app_client):
     from app import hyperswitch as hs
-    from app import sweep
-    from app.main import app
-
-    async def no_sweep():   # keep the background sweep out of tests
-        return None
 
     async def fake_retrieve_payment(payment_id):   # Hyperswitch GET -> the fixture's own object
         obj = json.loads(REAL)["content"]["object"]
@@ -106,10 +98,8 @@ def client():
         return obj
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(sweep, "sweep_forever", no_sweep)
         mp.setattr(hs, "retrieve_payment", fake_retrieve_payment)
-        with TestClient(app) as c:
-            yield c
+        yield app_client
 
 
 @pytest.fixture

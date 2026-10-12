@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from app.db import pool
 from app.remedies import REMEDIABLE_ORDER_STATUSES, _refund_value
+from app.settlement import store_time
 
 
 def _lb(value) -> str | None:
@@ -151,14 +152,22 @@ def _usd(cents: int) -> str:
     return f"${cents / 100:,.2f}"
 
 
+# Customer-facing only: plain language, never an error code or processor message.
 REMEDY_MESSAGES = {
-    "approved": "Refund of {amt} approved. It's being processed.",
-    "refund_pending": "Refund of {amt} is processing.",
-    "awaiting_settlement": "Refund of {amt} approved. It will post once your payment settles.",
+    "awaiting_settlement": "Refund of {amt} approved. It will be sent after your payment settles, by {by}.",
+    "refund_pending": "Refund of {amt} has been sent to your bank.",
     "refunded": "Refunded {amt}. It can take a few days to appear, depending on your bank.",
+    "needs_manual_refund": "Our team is processing your refund of {amt}.",
     "replacement_scheduled": "A free replacement will be added to your next order.",
-    "failed": "We couldn't process this refund automatically. Our team will follow up.",
+    # legacy states (no new rows use them)
+    "approved": "Refund of {amt} approved.",
+    "failed": "Our team is processing your refund of {amt}.",
 }
+
+
+def remedy_message(r: dict) -> str:
+    by = store_time(r["next_attempt_at"], "%b %-d") if r.get("next_attempt_at") else "the next business day"
+    return REMEDY_MESSAGES[r["status"]].format(amt=_usd(r["amount_cents"]), by=by)
 
 
 def remedy_view(r: dict) -> dict:
@@ -172,7 +181,7 @@ def remedy_view(r: dict) -> dict:
         "amount_cents": r["amount_cents"],
         "status": r["status"],
         "note": r["note"],
-        "message": REMEDY_MESSAGES[r["status"]].format(amt=_usd(r["amount_cents"])),
+        "message": remedy_message(r),
     }
 
 
