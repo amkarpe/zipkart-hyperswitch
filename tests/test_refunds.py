@@ -404,3 +404,59 @@ def test_refund_copy_has_statement_timing():
     for status, text in REMEDY_MESSAGES.items():
         if status != "replacement_scheduled":
             assert text.endswith(STATEMENT_NOTE), status
+
+
+# ── Effective settlement config ─────────────────────────────────────────────
+ZK6_CAPTURE = datetime(2026, 10, 12, 0, 10, tzinfo=LA)   # the production case: ~12:10 AM PDT
+
+
+def test_config_override_changes_the_gate(monkeypatch):
+    import dataclasses
+
+    from app import settlement
+    for cutoff, expected in (("15:00", datetime(2026, 10, 13, 4, 0, tzinfo=UTC)),    # Oct 12 11 PM CDT
+                             ("16:00", datetime(2026, 10, 13, 5, 0, tzinfo=UTC))):   # Oct 13 12 AM CDT
+        monkeypatch.setattr(settlement, "settings",
+                            dataclasses.replace(settlement.settings, settlement_cutoff=cutoff,
+                                                settlement_timezone="America/Los_Angeles",
+                                                settlement_margin_hours=6.0))
+        assert settlement.refund_gate(ZK6_CAPTURE) == expected
+
+
+def test_effective_config_reports_value_and_source(monkeypatch):
+    import dataclasses
+
+    from app import settlement
+    monkeypatch.delenv("SETTLEMENT_CUTOFF", raising=False)
+    assert settlement.effective_config()["settlement_cutoff"]["source"] == "default"
+    monkeypatch.setenv("SETTLEMENT_CUTOFF", "15:00")
+    monkeypatch.setattr(settlement, "settings", dataclasses.replace(settlement.settings, settlement_cutoff="15:00"))
+    cfg = settlement.effective_config()
+    assert cfg["settlement_cutoff"] == {"value": "15:00", "source": "env"}
+    assert set(cfg) == {"settlement_cutoff", "settlement_timezone", "settlement_margin_hours",
+                        "refund_max_auto_attempts_per_payment", "store_timezone"}
+
+
+def test_startup_log_shows_effective_values(monkeypatch, caplog):
+    import dataclasses
+    import logging
+
+    from app import main, settlement
+    monkeypatch.setenv("SETTLEMENT_CUTOFF", "15:00")
+    monkeypatch.setattr(settlement, "settings", dataclasses.replace(settlement.settings, settlement_cutoff="15:00"))
+    with caplog.at_level(logging.INFO, logger="zipkart"):
+        main.log_settlement_config()
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("settlement config:"))
+    assert "settlement_cutoff=15:00 (env)" in line
+    assert "settlement_timezone=America/Los_Angeles" in line and "settlement_margin_hours=" in line
+    assert "refund_max_auto_attempts_per_payment=" in line
+
+
+def test_health_shows_effective_settlement_config(app_client):
+    body = app_client.get("/health").json()
+    s = body["settlement"]
+    assert s["settlement_cutoff"]["value"] == "16:00" and s["settlement_cutoff"]["source"] in ("env", "default")
+    assert s["settlement_timezone"]["value"] == "America/Los_Angeles"
+    assert s["settlement_margin_hours"]["value"] == 6.0
+    assert s["refund_max_auto_attempts_per_payment"]["value"] == 4
+    assert "latest_migration" in body and "commit" in body

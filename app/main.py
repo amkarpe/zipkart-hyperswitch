@@ -22,6 +22,7 @@ from app.db import close_pool, open_pool, pool
 from app.fulfillment import FulfillmentError
 from app.payments import CheckoutError
 from app.pricing import PricingError
+from app.settlement import describe_config, effective_config
 from app.refunds import RefundError
 from app.remedies import RemedyError, create_remedy
 from app.store import router as store_router
@@ -64,8 +65,13 @@ def _check_base_url() -> None:
                     "redirected to the wrong site after paying", base, render_url)
 
 
+def log_settlement_config() -> None:
+    log.info("settlement config: %s", describe_config())
+
+
 async def lifespan(_app: FastAPI):
     _check_base_url()
+    log_settlement_config()
     await open_pool()
     sweeper = asyncio.create_task(sweep.sweep_forever()) if settings.sweep_timer_enabled else None
     log.info("background sweep timer: %s", "on" if sweeper else
@@ -191,7 +197,8 @@ async def health():
     return {"status": "ok", "database": "ok", "migrations_applied": migrations,
             "latest_migration": latest and {"filename": latest["filename"],
                                             "applied_at": latest["applied_at"].isoformat()},
-            "commit": (os.environ.get("RENDER_GIT_COMMIT") or "local")[:7]}
+            "commit": (os.environ.get("RENDER_GIT_COMMIT") or "local")[:7],
+            "settlement": effective_config()}
 
 
 @app.get("/api/products")

@@ -11,6 +11,7 @@ across the PDT/PST change (23:00Z in summer, 00:00Z in winter). The margin is re
 elapsed time, so it's added in UTC (Python adds timedeltas to zoned datetimes in wall
 time).
 """
+import os
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -35,3 +36,24 @@ def refund_gate(t: datetime, margin_hours: float | None = None, **kw) -> datetim
 
 def store_time(t: datetime, fmt: str = "%b %-d, %-I:%M %p %Z") -> str:
     return t.astimezone(ZoneInfo(settings.store_timezone)).strftime(fmt)
+
+
+def effective_config() -> dict:
+    """The settlement/refund settings actually in force, and where each came from.
+    Logged at startup and shown in /health, so a wrong override (e.g. a stale
+    SETTLEMENT_CUTOFF on the host) is visible right after a deploy, not via a refund time."""
+    def item(env_key: str, value):
+        return {"value": value, "source": "env" if os.environ.get(env_key, "").strip() else "default"}
+    return {
+        "settlement_cutoff": item("SETTLEMENT_CUTOFF", settings.settlement_cutoff),
+        "settlement_timezone": item("SETTLEMENT_TIMEZONE", settings.settlement_timezone),
+        "settlement_margin_hours": item("SETTLEMENT_MARGIN_HOURS", settings.settlement_margin_hours),
+        "refund_max_auto_attempts_per_payment": item("REFUND_MAX_AUTO_ATTEMPTS_PER_PAYMENT",
+                                                     settings.refund_max_auto_attempts_per_payment),
+        "store_timezone": item("STORE_TIMEZONE", settings.store_timezone),
+    }
+
+
+def describe_config(cfg: dict | None = None) -> str:
+    cfg = cfg or effective_config()
+    return ", ".join(f"{k}={v['value']} ({v['source']})" for k, v in cfg.items())

@@ -174,6 +174,12 @@ velocity filter.
 **Deploys:** every push to `main` deploys automatically (Auto-Deploy: On Commit). After a push,
 wait until `/health` reports the new commit (`RENDER_GIT_COMMIT`) before treating it as live.
 
+**Settlement settings live in one place: the code defaults** (`app/config.py`). `render.yaml`
+deliberately doesn't set them (a copy there once said 15:00 while the code said 16:00, and refunds
+were scheduled an hour early). An env var on the service still overrides the default, and a
+service value beats an environment group. `/health` and the startup log show each effective value
+and whether it came from `env` or `default`, so check them after every deploy.
+
 After the first deploy:
 1. Copy the service URL from the Render dashboard **exactly** (Render may add a suffix such as
    `-eiwx`), set `APP_BASE_URL` to it and redeploy. Check the startup log for an `APP_BASE_URL`
