@@ -13,8 +13,25 @@ substituted or removed. So ZipKart doesn't charge at checkout. It:
 4. **captures the final amount** once (a partial capture; the rest of the hold is released),
 5. handles **cancellations** (voiding the hold) and **post-delivery problems** (partial refunds
    or free replacements),
-6. keeps everything in sync through **signed webhooks**, the return page, and a
-   **reconciliation sweep**.
+6. keeps orders in sync with Hyperswitch: the **reconciliation sweep** is the source of truth (it
+   re-fetches every open payment and refund from Hyperswitch), the **return page** is a fast path
+   right after checkout, and **signed webhooks** are hints (they don't arrive from Hyperswitch's
+   sandbox to Render; see [Known limitations](#known-limitations)).
+
+Built with AI assistance (Claude Code); the session is shared with the submission.
+
+## For reviewers
+
+- **Live app:** https://zipkart-eiwx.onrender.com
+- **Store console:** https://zipkart-eiwx.onrender.com/store (the password is provided with the
+  submission).
+- **Test card:** `4111 1111 1111 1111`, any future expiry, any CVC.
+- **The first load can take about a minute**: the free Render instance sleeps when idle.
+- **Refunds go out after next-day settlement.** Authorize.net only refunds settled captures, so a
+  refund reported during a review shows as *scheduled* ("will be sent after your payment
+  settles, by …"), not sent.
+- **Hyperswitch's sandbox webhooks don't reach Render.** Status stays correct without them; see
+  [Known limitations](#known-limitations).
 
 ## How it fits together
 
@@ -22,7 +39,7 @@ substituted or removed. So ZipKart doesn't charge at checkout. It:
 Browser (plain HTML/JS)            FastAPI (Python)                      Hyperswitch sandbox ─▶ Authorize.net
   checkout  ── SKUs + quantities ─▶ prices the cart server-side ─────────▶ POST /payments (manual capture)
   Web SDK   ◀─ client_secret ─────  (secret API key stays on the server)
-  order page ◀─ polls our API ────  Postgres on Neon (orders, items, payments, remedies, refunds, webhook_events)
+  order page ◀─ polls the API ─────  Postgres on Neon (orders, items, payments, remedies, refunds, webhook_events)
   store console (/store)            ◀── signed webhooks, GET /payments/{id}, GET /refunds/{id}
 ```
 
@@ -32,10 +49,11 @@ Browser (plain HTML/JS)            FastAPI (Python)                      Hypersw
 - **No database transaction is held across a Hyperswitch call**: write the intent and commit, call
   Hyperswitch, then record the result in a second transaction.
 - **Hyperswitch is the source of truth** for payment and refund status. Webhook payloads, the return
-  page's query string and the browser are only hints; we always re-fetch and apply forward-only.
+  page's query string and the browser are only hints; the app always re-fetches and applies
+  forward-only.
 - Every outbound call has a **deterministic ID** (`pay_{order}_{attempt}`,
   `rf_{order}_{item}_{reason}_r{remedy}_a{attempt}`), so a retry after a timeout can't double-charge or
-  double-refund: Hyperswitch answers `HE_01` and we fetch instead.
+  double-refund: Hyperswitch answers `HE_01` and the app fetches instead.
 
 ## Run it locally
 
@@ -141,23 +159,28 @@ Open **two windows side by side**: the customer on the left, the store console o
 7. **Customer: report a problem.** Below the receipt: missing (refund), damaged or expired (refund
    or free replacement), with a quantity for fixed-price items. A refund is never sent before the
    capture settles: it's scheduled for the first cut-off after the capture plus a margin
-   (*"Refund of $X approved. It will be sent after your payment settles, by Oct 12."*), and the
+   (*"Refund of $X approved. It will be sent after your payment settles, by <date>."*), and the
    sweep sends it when it's due. The store console shows each refund's status, next attempt (store
    time) and attempts used out of 4; anything automation can't finish is marked **needs manual
    refund** with the reason. After refunding it in the Authorize.net dashboard, the shopper
    records it with **Mark refunded manually** (processor transaction ID and a note required),
-   and the customer sees the refund as sent.
+   and the customer sees the refund as sent. One processor transaction ID can belong to only one
+   remedy (checked by the app and enforced by a unique index). A mistyped ID is fixed with
+   **Correct processor reference** (new ID and a reason required; the status doesn't change), and
+   every correction is kept in `remedy_txn_corrections` and shown on the remedy.
 
 ### Test cards (Authorize.net sandbox)
 
 | Card | Number | |
 |---|---|---|
-| Visa | `4111 1111 1111 1111` | any future expiry, any CVV |
-| Mastercard | `5424 0000 0000 0015` | |
-| Amex | `3700 0000 0000 002` | |
-| Discover | `6011 0000 0000 0012` | |
+| Visa | `4111 1111 1111 1111` | any future expiry, any CVC. **Tested with this app.** |
+| Mastercard | `5424 0000 0000 0015` | per Authorize.net's testing guide, not verified here |
+| Amex | `3700 0000 0000 002` | per Authorize.net's testing guide, not verified here |
+| Discover | `6011 0000 0000 0012` | per Authorize.net's testing guide, not verified here |
 
-To force a decline, use billing ZIP **46282**. If many test payments go through in a short time,
+Authorize.net's testing guide says billing ZIP **46282** forces a decline; not verified here. The
+payment form (Hyperswitch SDK) collects only card number, expiry and CVC, so the billing ZIP the app
+sends is the delivery ZIP entered on ZipKart's checkout form. If many test payments go through in a short time,
 Authorize.net's Fraud Detection Suite may **hold** authorizations for review; ZipKart shows these as
 "Your payment is being reviewed". Approve or void them in the Authorize.net dashboard, or relax the
 velocity filter.
@@ -188,27 +211,40 @@ After the first deploy:
    `-eiwx`), set `APP_BASE_URL` to it and redeploy. Check the startup log for an `APP_BASE_URL`
    warning.
 2. In the Hyperswitch dashboard, set the profile's webhook URL to `https://<app>/webhooks/hyperswitch`.
-3. Make a test payment and confirm the webhook deliveries show HTTP 200 in the Hyperswitch dashboard.
-   Deliveries that can't be processed are recorded in the `webhook_failures` table (stage, error,
-   headers with the signature redacted, raw body).
+3. Make a test payment and check the webhook deliveries in the Hyperswitch dashboard. HTTP 200 is
+   expected on most hosts, but it hasn't been observed on Render: Hyperswitch's sandbox deliveries
+   don't reach it (see [Known limitations](#known-limitations)). Deliveries that reach the app but
+   can't be processed are recorded in the `webhook_failures` table (stage, error, headers with the
+   signature redacted, raw body).
 
 **Cold starts:** Render's free tier sleeps after ~15 minutes idle; the first request after that
 takes up to a minute. Neon also scales to zero, but wakes in well under a second. While the app
 sleeps the background sweep doesn't run; it runs again on wake-up (see the external triggers under
 Known limitations).
 
-## What the sandbox taught us (and the code relies on)
+## Sandbox findings
 
-- `net_amount = amount + shipping_cost + order_tax_amount`. We send the item hold as `amount` and
-  verify `net_amount` equals our hold.
+These were observed in the Hyperswitch and Authorize.net sandboxes, and the code relies on them.
+
+- `net_amount = amount + shipping_cost + order_tax_amount`. The app sends the item hold as `amount`
+  and verifies that `net_amount` equals the hold.
 - `amount_to_capture` is the exact total charged and is checked against `net_amount`. Capturing all
   of it gives `succeeded`; less gives `partially_captured` (capture is then final; a second one is `IR_14`).
 - **Hyperswitch allows `/cancel` after a partial capture on Authorize.net**, which voids the whole
-  capture. Only our order-state checks prevent it, and the sync flags any such change for review.
+  capture. Only the app's order-state checks prevent it, and the sync flags any such change for review.
 - `IR_16` means "can't cancel in this state" (already cancelled, or held for review), not only
   "already cancelled".
 - Refunds before the nightly settlement fail with Authorize.net error **54** (`UE_4000`), and
-  Hyperswitch keeps that failed refund under our `refund_id`, hence the attempt suffix.
+  Hyperswitch keeps that failed refund under the app's `refund_id`, hence the attempt suffix.
+- **Settlement batches run hours after the cut-off.** Batches were observed in the Authorize.net
+  dashboard at 8:45 PM PDT (Oct 10) and 7:32 PM PDT (Oct 11), for a 4:00 PM PDT cut-off. That is
+  why the first refund attempt waits until cut-off + 6 hours.
+- **Authorize.net rejects duplicate transactions** (error 11): the same transaction type, card and
+  amount within 2 minutes (its default `duplicateWindow`, always 2 minutes in the Virtual
+  Terminal). Observed when two $1.49 refunds were entered for one order in the dashboard. Two
+  automatic refunds of the same amount on one payment, sent in the same sweep run, could likely hit
+  the same filter; the second would go to *needs manual refund*. This hasn't been observed through
+  Hyperswitch.
 
 ## Known limitations
 
@@ -244,9 +280,9 @@ Known limitations).
   records every delivery to Render as `WebhookCallFailed`, and none appears in Render's logs. The
   identical request (same body, signature and headers, replayed from a captured delivery) reaches
   Render and returns 200 from a Mac and from cron-job.org, and Hyperswitch delivers fine to
-  webhook.site. So the failure is on the route from Hyperswitch's sandbox to Render, not in our
-  code. Webhooks are treated as hints: the return page and the sweep keep payments and refunds in
-  sync without them.
+  webhook.site. So the failure is on the route from Hyperswitch's sandbox to Render, not in the app.
+  Webhooks are treated as hints: the return page and the sweep keep payments and refunds in sync
+  without them.
 - **Automated tests cover the webhook handler and the refund/remedy flow** (`tests/`, run against
   the dev branch). Checkout, picking and capture were tested with scripts against the sandbox and
   in the browser.

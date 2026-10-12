@@ -11,6 +11,7 @@ The HTTP tests need DATABASE_URL (they write uniquely-named rows and delete them
 patch the Hyperswitch GET, so they make no network calls to Hyperswitch.
 """
 import json
+import os
 import uuid
 from pathlib import Path
 
@@ -208,8 +209,10 @@ REAL_HEADERS = {"accept-encoding": "gzip", "accept": "*/*", "user-agent": "Hyper
                 "via": "HyperSwitch", "content-type": "application/json"}
 
 
+@pytest.mark.skipif(not os.environ.get("HYPERSWITCH_WEBHOOK_SECRET", "").strip(),
+                    reason="needs HYPERSWITCH_WEBHOOK_SECRET (the profile's payment response hash key)")
 def test_real_hyperswitch_signature_verifies():
-    # Requires HYPERSWITCH_WEBHOOK_SECRET to be the profile's payment response hash key.
+    # The signature was made by Hyperswitch with the real key; the key itself is never in the repo.
     assert len(REFUND_54) == 996
     assert signature_valid(REFUND_54, REFUND_54_SIGNATURE)
 
