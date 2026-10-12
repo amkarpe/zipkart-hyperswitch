@@ -653,3 +653,32 @@ def test_concurrent_records_of_the_same_txn_only_one_wins(db, fake_hs):
     assert sorted(map(str, results))[0].startswith("This processor transaction is already recorded on remedy")
     assert results.count(True) == 1
     assert db.sql("SELECT count(*) AS n FROM remedies WHERE manual_refund_txn_id = %s", txn)[0]["n"] == 1
+
+
+def test_database_rejects_duplicate_processor_txn(db, fake_hs, store):
+    # Needs migration 012 (the unique index).
+    import psycopg
+    txn = _txn()
+    _manually_refunded(db, fake_hs, store, txn)
+    _oid2, rid2 = _manually_refunded(db, fake_hs, store, _txn())
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        db.sql("UPDATE remedies SET manual_refund_txn_id = %s WHERE id = %s", txn, rid2)
+
+
+def test_constraint_backstop_gives_the_same_clear_error(db, fake_hs, store, monkeypatch):
+    # If the app-level check were bypassed, the unique index still stops it, with the same message.
+    from app import refunds
+    txn = _txn()
+    _oid1, rid1 = _manually_refunded(db, fake_hs, store, txn)
+    oid2, rid2 = _needs_manual(db, fake_hs)
+    real = refunds._txn_owner
+    calls = {"n": 0}
+
+    async def miss_first_check(conn, txn_id, exclude):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else await real(conn, txn_id, exclude)
+    monkeypatch.setattr(refunds, "_txn_owner", miss_first_check)
+    r = store.post(f"/store/api/orders/{oid2}/remedies/{rid2}/mark-refunded",
+                   json={"processor_transaction_id": txn, "note": "n"})
+    assert r.status_code == 409 and r.json()["detail"] == f"This processor transaction is already recorded on remedy {rid1}."
+    assert db.remedy_row(rid2)["status"] == "needs_manual_refund"
